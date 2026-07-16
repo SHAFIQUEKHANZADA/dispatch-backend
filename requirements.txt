@@ -1,0 +1,20 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy==2.0.36
+greenlet==3.1.1
+asyncpg==0.30.0
+aiosqlite==0.20.0
+pydantic==2.10.4
+pydantic-settings==2.7.0
+python-multipart==0.0.20
+PyJWT==2.10.1
+cryptography==44.0.0   # required to verify ES256/RS256 (asymmetric) Supabase JWTs
+python-dateutil==2.9.0.post0
+httpx==0.28.1
+# Windows has no system IANA tz database; zoneinfo needs this to resolve
+# "America/Chicago". Harmless (and a good idea) on Linux containers too.
+tzdata==2024.2
+
+# dev / test
+pytest==8.3.4
+pytest-asyncio==0.25.0
