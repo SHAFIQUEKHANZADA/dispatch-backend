@@ -254,8 +254,8 @@ async def assign(body: AssignRequest, session: SessionDep, current: CurrentUserD
         engine_version=ranking.engine_version,
         weights_used=ranking.to_dict()["weights"],
         assigned_by=current.user_id,
-        assigned_at=datetime.now(timezone.utc),
-        started_at=datetime.now(timezone.utc),
+        assigned_at=shop.now,
+        started_at=shop.now,
     )
     session.add(assignment)
 
@@ -397,7 +397,7 @@ async def smart_decision_apply(
                 engine_version=ranking.engine_version,
                 weights_used=ranking.to_dict()["weights"],
                 assigned_by=current.user_id,
-                started_at=datetime.now(timezone.utc),
+                started_at=shop.now,
             )
         )
         ro.status = "IN_PROGRESS"

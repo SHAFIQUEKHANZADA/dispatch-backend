@@ -81,6 +81,14 @@ async def dashboard(session: SessionDep, current: CurrentUserDep):
 
     hours_sold_today = sum(float(r.est_hours or 0) for r in ready + in_progress)
 
+    # Promise-time picture. "Protected" is not a guess: it's every open RO that
+    # carries a promise and is NOT in the at-risk list — i.e. someone can still
+    # physically finish it in time (or it's already on a bench).
+    promised = [r for r in ready + in_progress if r.promise_at is not None]
+    promise_total = len(promised)
+    promise_at_risk = len(at_risk)
+    promise_protected = max(0, promise_total - promise_at_risk)
+
     return {
         "open_ros": sum(1 for r in ros if r.status == "OPEN"),
         "pending_authorization": sum(1 for r in ros if r.status == "PENDING_AUTHORIZATION"),
@@ -96,6 +104,9 @@ async def dashboard(session: SessionDep, current: CurrentUserDep):
         "idle_technicians": idle,
         "overloaded_technicians": overloaded,
         "ros_at_risk": at_risk,
+        "promise_total": promise_total,
+        "promise_protected": promise_protected,
+        "promise_at_risk": promise_at_risk,
         "hours_sold_today": round(hours_sold_today, 1),
         "capacity_hours_today": round(capacity_today, 1),
         "guardian": {

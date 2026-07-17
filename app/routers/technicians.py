@@ -3,12 +3,13 @@ and FR-5 (the Available Techs screen)."""
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import date, time
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
 from .. import audit
@@ -50,6 +51,13 @@ class SpecialtyIn(BaseModel):
     vehicle_specialty: Optional[str] = None
 
 
+# The DMS tech # is the join key to the dealership's DMS export — a typo here
+# silently orphans every one of that tech's history rows (they import as
+# "unmatched"), which quietly poisons their familiarity map and scoreboard.
+# So it is validated, not trusted.
+DMS_TECH_NO_RE = re.compile(r"^[A-Za-z]{0,3}\d{2,6}$")
+
+
 class TechnicianIn(BaseModel):
     name: str
     employee_id: Optional[str] = None
@@ -57,6 +65,26 @@ class TechnicianIn(BaseModel):
     team: Optional[str] = None
     skill_level: Optional[str] = None
     active: bool = True
+
+    @field_validator("dms_tech_no")
+    @classmethod
+    def valid_dms_no(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or not v.strip():
+            return None
+        v = v.strip().upper()
+        if not DMS_TECH_NO_RE.match(v):
+            raise ValueError(
+                f"'{v}' is not a valid DMS tech number. Expected the format your DMS "
+                f"uses — up to 3 letters followed by 2–6 digits (e.g. T104, H045, 231)."
+            )
+        return v
+
+    @field_validator("name")
+    @classmethod
+    def valid_name(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Name is required")
+        return v.strip()
 
     shift_start: Optional[time] = None
     shift_end: Optional[time] = None
