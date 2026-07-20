@@ -1,0 +1,259 @@
+"""Pure mapping: myKaarma Order v2 JSON -> 3D Dispatch repair_orders / ro_lines.
+
+Pure functions only — no DB, no HTTP. Same discipline as the scoring engine, so
+the mapping is unit-testable against captured payloads and a field change shows
+up as a failing test rather than silently-wrong ROs on the board.
+
+Field contract per the v2 Integration Data Contract:
+    header.status / dmsStatus          -> status bucket
+    header.promisedDate + promisedTime -> promise_at
+    header.waiter                      -> WAITING flag
+    header.soldHours / actualHours     -> hours
+    header.createDate/Time             -> written_at
+    header.mileageIn/Out               -> mileage
+    jobs[].laborOpCode / laborType     -> ro_lines + concern category lookup
+    jobs[].techNo                      -> current DMS assignment (drift detection)
+    jobs[].parts[]                     -> waiting-on-parts detection
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from dateutil import parser as dateparser
+
+# myKaarma / DMS status strings -> our board buckets. Anything unrecognised
+# falls to OPEN rather than being guessed into a dispatchable state.
+STATUS_MAP: dict[str, str] = {
+    # ready to work
+    "READY": "READY_TO_DISPATCH",
+    "READY_TO_DISPATCH": "READY_TO_DISPATCH",
+    "DISPATCH": "READY_TO_DISPATCH",
+    "OPEN": "OPEN",
+    "NEW": "OPEN",
+    "CREATED": "OPEN",
+    # blocked
+    "PENDING_AUTHORIZATION": "PENDING_AUTHORIZATION",
+    "PENDING_AUTH": "PENDING_AUTHORIZATION",
+    "AWAITING_APPROVAL": "PENDING_AUTHORIZATION",
+    "APPROVAL": "PENDING_AUTHORIZATION",
+    "WAITING_ON_PARTS": "WAITING_ON_PARTS",
+    "WAITING_PARTS": "WAITING_ON_PARTS",
+    "PARTS": "WAITING_ON_PARTS",
+    # working / done
+    "IN_PROGRESS": "IN_PROGRESS",
+    "WIP": "IN_PROGRESS",
+    "WORKING": "IN_PROGRESS",
+    "CLOSED": "COMPLETED",
+    "COMPLETE": "COMPLETED",
+    "COMPLETED": "COMPLETED",
+    "FINALIZED": "COMPLETED",
+}
+
+
+@dataclass
+class MappedLine:
+    op_code: Optional[str]
+    description: str
+    flagged_hours: float
+    labor_type: Optional[str]          # CP | WARRANTY | INTERNAL
+    tech_no: Optional[str]             # DMS tech on this line (drift detection)
+    dispatch_line_status: Optional[str]
+    waiting_on_parts: bool
+
+
+@dataclass
+class MappedRO:
+    ro_number: str
+    order_uuid: Optional[str]
+    status: str
+    vin: Optional[str]
+    vehicle_year: Optional[int]
+    vehicle_make: Optional[str]
+    vehicle_model: Optional[str]
+    mileage: Optional[int]
+    est_hours: float
+    written_at: Optional[datetime]
+    promise_at: Optional[datetime]
+    flags: list[str]
+    advisor_id: Optional[str]
+    appointment_number: Optional[str]
+    customer_uuid: Optional[str]
+    vehicle_uuid: Optional[str]
+    read_checksum: Optional[str]
+    lines: list[MappedLine] = field(default_factory=list)
+    # every DMS tech number seen on the lines — used to detect assignment drift
+    dms_tech_nos: list[str] = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# helpers                                                                      #
+# --------------------------------------------------------------------------- #
+
+
+def _num(v: Any, default: float = 0.0) -> float:
+    """Parse a number, rounded to 2dp.
+
+    Labor hours are quoted to a tenth in the shop; raw float division leaves
+    noise like 1.1999999999999999 which would render on the dispatch board as-is.
+    Round at the boundary so nothing downstream inherits the fuzz.
+    """
+    try:
+        return round(float(v), 2)
+    except (TypeError, ValueError):
+        return default
+
+
+def _int(v: Any) -> Optional[int]:
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _dt(value: Any) -> Optional[datetime]:
+    """Parse a myKaarma date/datetime into aware UTC. None if unparseable —
+    never guess a time; a wrong promise time is worse than a missing one."""
+    if not value:
+        return None
+    try:
+        dt = dateparser.parse(str(value))
+    except (ValueError, OverflowError, TypeError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _combine_date_time(date_val: Any, time_val: Any) -> Optional[datetime]:
+    """header.promisedDate + header.promisedTime arrive as separate fields."""
+    if not date_val:
+        return None
+    if not time_val:
+        return _dt(date_val)
+    combined = f"{str(date_val).strip()} {str(time_val).strip()}"
+    return _dt(combined) or _dt(date_val)
+
+
+def map_status(header: dict) -> str:
+    """Prefer the DMS status; fall back to the myKaarma status. Unknown -> OPEN."""
+    for key in ("dmsStatus", "status"):
+        raw = header.get(key)
+        if raw:
+            token = str(raw).strip().upper().replace(" ", "_").replace("-", "_")
+            if token in STATUS_MAP:
+                return STATUS_MAP[token]
+    return "OPEN"
+
+
+def map_labor_type(raw: Any) -> Optional[str]:
+    if not raw:
+        return None
+    t = str(raw).strip().upper()
+    if t.startswith("C"):
+        return "CP"
+    if t.startswith("W"):
+        return "WARRANTY"
+    if t.startswith("I"):
+        return "INTERNAL"
+    return None
+
+
+def line_waiting_on_parts(job: dict) -> bool:
+    """A line is parts-blocked when any part has been ordered but not sold/filled."""
+    for p in job.get("parts", []) or []:
+        ordered = _num(p.get("quantityOrdered"))
+        sold = _num(p.get("quantitySold"))
+        if ordered > sold:
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# the mapping                                                                  #
+# --------------------------------------------------------------------------- #
+
+
+def map_order(payload: dict) -> MappedRO:
+    """Map one Order v2 `global_order` response into our RO shape."""
+    order = payload.get("order") or payload.get("globalOrder") or payload
+    header = order.get("header") or {}
+    customer = order.get("customer") or {}
+    vehicle = order.get("vehicle") or {}
+    jobs = order.get("jobs") or []
+
+    lines: list[MappedLine] = []
+    tech_nos: list[str] = []
+    any_parts_block = False
+
+    for job in jobs:
+        blocked = line_waiting_on_parts(job)
+        any_parts_block = any_parts_block or blocked
+        tech_no = job.get("techNo") or job.get("technicianNumber")
+        if tech_no:
+            tech_nos.append(str(tech_no).strip())
+        lines.append(
+            MappedLine(
+                op_code=(str(job.get("laborOpCode")).strip() if job.get("laborOpCode") else None),
+                description=(
+                    job.get("laborOpCodeDesc")
+                    or job.get("description")
+                    or job.get("laborOpCode")
+                    or "Labor line"
+                ),
+                flagged_hours=_num(job.get("soldHours")),
+                labor_type=map_labor_type(job.get("laborType")),
+                tech_no=(str(tech_no).strip() if tech_no else None),
+                dispatch_line_status=job.get("dispatchLineStatus"),
+                waiting_on_parts=blocked,
+            )
+        )
+
+    status = map_status(header)
+    # A parts-blocked line overrides a "ready" status — you cannot dispatch work
+    # whose parts have not arrived, whatever the DMS header says.
+    if any_parts_block and status in ("READY_TO_DISPATCH", "OPEN"):
+        status = "WAITING_ON_PARTS"
+
+    flags: list[str] = []
+    if header.get("waiter"):
+        flags.append("WAITING")
+
+    est = _num(header.get("soldHours"))
+    if est <= 0:
+        est = round(sum(l.flagged_hours for l in lines), 2)
+
+    return MappedRO(
+        ro_number=str(
+            header.get("roNumber") or header.get("orderNumber") or header.get("number") or ""
+        ).strip(),
+        order_uuid=order.get("uuid") or header.get("orderUuid"),
+        status=status,
+        vin=(str(vehicle.get("vin")).strip().upper() if vehicle.get("vin") else None),
+        vehicle_year=_int(vehicle.get("year") or vehicle.get("vehicleYear")),
+        vehicle_make=vehicle.get("make") or vehicle.get("vehicleMake"),
+        vehicle_model=vehicle.get("model") or vehicle.get("vehicleModel"),
+        mileage=_int(header.get("mileageIn") or header.get("mileageOut")),
+        est_hours=est,
+        written_at=_combine_date_time(header.get("createDate"), header.get("createTime")),
+        promise_at=_combine_date_time(header.get("promisedDate"), header.get("promisedTime")),
+        flags=flags,
+        advisor_id=(
+            str(header.get("advisorNumber")).strip() if header.get("advisorNumber") else None
+        ),
+        appointment_number=(
+            str(header.get("appointmentNumber")).strip()
+            if header.get("appointmentNumber")
+            else None
+        ),
+        customer_uuid=customer.get("uuid"),
+        vehicle_uuid=vehicle.get("uuid"),
+        # Required header for any future write-back call.
+        read_checksum=payload.get("orderReadChecksum") or order.get("orderReadChecksum"),
+        lines=lines,
+        dms_tech_nos=sorted(set(tech_nos)),
+    )

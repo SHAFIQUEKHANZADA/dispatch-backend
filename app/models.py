@@ -290,7 +290,28 @@ class OpCodeMap(Base):
     tier: Mapped[Optional[str]] = mapped_column(String(1))
     excluded: Mapped[bool] = mapped_column(Boolean, default=False)
     exclusion_reason: Mapped[Optional[str]] = mapped_column(Text)
+    mykaarma_uuid: Mapped[Optional[str]] = mapped_column(Text)
+    duration_minutes: Mapped[Optional[int]] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(Text, default="MANUAL")  # MANUAL | CSV | MYKAARMA
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class MyKaarmaDealer(Base):
+    __tablename__ = "mykaarma_dealers"
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("dealers.id", ondelete="CASCADE"), primary_key=True
+    )
+    username: Mapped[str] = mapped_column(Text, nullable=False)
+    password: Mapped[str] = mapped_column(Text, nullable=False)
+    dealer_uuid: Mapped[str] = mapped_column(Text, nullable=False)
+    department_uuid: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    ro_scope_granted: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_synced_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime)
+    last_sync_status: Mapped[Optional[str]] = mapped_column(Text)
+    last_sync_detail: Mapped[dict] = mapped_column(JSONBType(), default=dict)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
 
 
 class ImportRun(Base):

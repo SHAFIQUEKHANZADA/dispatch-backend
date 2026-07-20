@@ -35,6 +35,25 @@ class Settings(BaseSettings):
     # Match Scores are reproducible.  seed.py writes this. Leave empty in prod.
     demo_now: str = ""
 
+    # --- myKaarma (live DMS) ------------------------------------------------
+    # Per-dealer credentials live in the mykaarma_dealers table. These env vars
+    # are the fallback used for the sandbox / single-store setup. Rotate before
+    # production. myKaarma geo-blocks non-US IPs on the web portal (not the API);
+    # test the API from a US-hosted server (Railway).
+    mykaarma_username: str = ""
+    mykaarma_password: str = ""
+    mykaarma_dealer_uuid: str = ""
+    mykaarma_department_uuid: str = ""
+
+    @property
+    def mykaarma_env_configured(self) -> bool:
+        return bool(
+            self.mykaarma_username
+            and self.mykaarma_password
+            and self.mykaarma_dealer_uuid
+            and self.mykaarma_department_uuid
+        )
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
