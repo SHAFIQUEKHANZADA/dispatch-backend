@@ -105,11 +105,11 @@ def _fmt_wait(minutes: float) -> str:
     if minutes <= 1:
         return "Available now"
     if minutes < 60:
-        return f"Available in {int(round(minutes))} minutes"
+        return f"Frees up in ~{int(round(minutes / 5) * 5)} min"
     hours = minutes / 60.0
     if abs(hours - round(hours)) < 0.05:
-        return f"Available in {int(round(hours))} hr"
-    return f"Available in {hours:.1f} hrs"
+        return f"Frees up in ~{int(round(hours))} hr"
+    return f"Frees up in ~{hours:.1f} hrs"
 
 
 def project_finish(
@@ -290,9 +290,11 @@ def _score_familiarity(ro: ROInput, tech: TechInput, ctx: ScoringContext) -> tup
 
     factor = math.log1p(done) / math.log1p(shop_max)
     points = weight * _clamp(factor)
+    # narrative phrasing, e.g. "High Electrical/AC experience — 28 ROs in 90 days"
+    depth = "High" if done >= 25 else "Solid" if done >= 10 else "Some"
     return points, Reason(
         "familiarity",
-        f"Completed {done} similar {ro.concern_category} repairs",
+        f"{depth} {ro.concern_category} experience — {done} ROs in 90 days",
         points,
     )
 
@@ -329,8 +331,8 @@ def _score_performance(ro: ROInput, tech: TechInput, ctx: ScoringContext) -> tup
     if have_eff and have_ftf:
         factor = PERF_EFFICIENCY_SHARE * eff_norm + PERF_FTF_SHARE * ftf_norm
         text = (
-            f"{stats.avg_efficiency:.0f}% efficiency and "
-            f"{stats.first_time_fix * 100:.0f}% first-time-fix on {ro.concern_category}"
+            f"{ro.concern_category} specialist · {stats.avg_efficiency:.0f}% efficiency, "
+            f"{stats.first_time_fix * 100:.0f}% first-time-fix"
         )
     elif have_eff:
         # Only score the half we actually have.  We do not backfill the other.

@@ -6,6 +6,7 @@ table you can reach without going through one.
 
 from __future__ import annotations
 
+import copy
 import uuid
 from datetime import date, datetime, time
 from typing import Optional
@@ -47,6 +48,88 @@ DEFAULT_MATCH_WEIGHTS = {
     "specialty_bonus": 3,
 }
 
+# Operational shop config that isn't a dedicated column yet — hours, days, bay
+# count, technician levels, teams, and dashboard display preferences. Kept as a
+# single JSON blob so the Store Settings page can persist the whole form without
+# a table per section. Everything here is real and reloads on refresh.
+DEFAULT_STORE_CONFIG = {
+    "hours": {"open": "07:00", "close": "19:00"},
+    "days_open": [True, True, True, True, True, True, False],  # Mon..Sun
+    "bays": 18,
+    "tech_levels": [
+        {"name": "L1 Apprentice", "set": "Main Shop", "bio_points": 330, "floor": 25, "cap": 65},
+        {"name": "L3 Apprentice", "set": "Main Shop", "bio_points": 370, "floor": 28, "cap": 74},
+        {"name": "L5 Apprentice", "set": "Main Shop", "bio_points": 410, "floor": 30, "cap": 82},
+        {"name": "Master", "set": "Main Shop", "bio_points": 455, "floor": 35, "cap": 90},
+        {"name": "Senior Master", "set": "Main Shop", "bio_points": 500, "floor": 38, "cap": 95},
+        {"name": "Lube Tech", "set": "Lube", "bio_points": 380, "floor": 35, "cap": 85},
+        {"name": "Senior Lube", "set": "Lube", "bio_points": 420, "floor": 38, "cap": 92},
+    ],
+    "teams": [
+        {"name": "Main Shop", "color": "blue"},
+        {"name": "Lube Team", "color": "amber"},
+    ],
+    "dashboard": {
+        "tech_sort": "priority_team",
+        "time_window": "full_day",
+        "finishing_soon_min": 20,
+        "group_by_team": True,
+        "show_off_shift": False,
+    },
+}
+
+
+# Scoreboard Settings: which metrics show on the TV boards, their goals + data
+# source, the display/rotation prefs, and the facility-utilization goal. Stored
+# as one JSON blob; the endpoint fills these defaults when the column is empty.
+def _metric(name, source, goal, show):
+    return {"name": name, "source": source, "goal": goal, "show": show}
+
+
+DEFAULT_SCOREBOARD_CONFIG = {
+    "display": {
+        "rotate_every_sec": 12,
+        "pause_resume_min": 30,
+        "rows_per_page": 14,
+        "default_rank_advisors": "CSI",
+        "default_rank_techs": "Eff %",
+        "facility_utilization_goal": 80,
+    },
+    "advisor_metrics": [
+        _metric("CSI", "MANUAL", "90%", True),
+        _metric("CP ROs", "MYKAARMA", "110", True),
+        _metric("Sales / RO", "DMS", "$260", True),
+        _metric("Recs / RO", "MYKAARMA", "2.8", True),
+        _metric("Hrs/RO vs Rec", "MYKAARMA", "1.00", True),
+        _metric("Video Sent", "MYKAARMA", "70%", True),
+        _metric("Survey Response %", "MANUAL", "35%", False),
+        _metric("Effective Labor Rate", "DMS", "$210", False),
+        _metric("Parts / RO", "DMS", "$170", False),
+        _metric("CP Sales", "DMS", "$40k", False),
+        _metric("Declined $ Recovered", "MYKAARMA", "15%", False),
+        _metric("2-Way Text Response", "MYKAARMA", "60%", False),
+        _metric("Appointment Show %", "DMS", "85%", False),
+        _metric("Tire Units", "DMS", "20", False),
+        _metric("Avg RO $", "DMS", "$480", False),
+    ],
+    "tech_metrics": [
+        _metric("Total Hours", "DMS", "150", True),
+        _metric("Hours (Week)", "DMS", "38", True),
+        _metric("RO's", "DMS", "80", True),
+        _metric("Hrs / RO", "DMS", "—", True),
+        _metric("Eff %", "DMS", "100%", True),
+        _metric("Fail Rec Closing %", "MYKAARMA", "25%", True),
+        _metric("Comeback Rate", "DMS", "3%", False),
+        _metric("Fixed Right First Time", "DMS", "90%", False),
+        _metric("Upsold Hours", "DMS", "12", False),
+        _metric("Proficiency %", "3D MATCH", "90%", False),
+        _metric("Hrs / Day", "DMS", "8.0", False),
+        _metric("Rework Hours", "DMS", "2.0", False),
+        _metric("MPI Completion %", "MYKAARMA", "95%", False),
+        _metric("Diag Accuracy %", "3D MATCH", "90%", False),
+    ],
+}
+
 
 class DealerSettings(Base):
     __tablename__ = "dealer_settings"
@@ -54,6 +137,8 @@ class DealerSettings(Base):
         Uuid, ForeignKey("dealers.id", ondelete="CASCADE"), primary_key=True
     )
     match_weights: Mapped[dict] = mapped_column(JSONBType(), default=lambda: dict(DEFAULT_MATCH_WEIGHTS))
+    store_config: Mapped[dict] = mapped_column(JSONBType(), default=lambda: copy.deepcopy(DEFAULT_STORE_CONFIG))
+    scoreboard_config: Mapped[dict] = mapped_column(JSONBType(), default=lambda: copy.deepcopy(DEFAULT_SCOREBOARD_CONFIG))
     enforce_team_separation: Mapped[bool] = mapped_column(Boolean, default=True)
     min_ros_to_rank: Mapped[int] = mapped_column(Integer, default=10)
     min_flagged_hours_to_rank: Mapped[float] = mapped_column(Numeric, default=15)
@@ -91,6 +176,14 @@ class Technician(Base):
     team: Mapped[Optional[str]] = mapped_column(Text)
     skill_level: Mapped[Optional[str]] = mapped_column(Text)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # Tech Settings roster + bio-approval workflow
+    hourly_rate: Mapped[Optional[float]] = mapped_column(Numeric)      # $/hr on the roster
+    cert_badges: Mapped[list[str]] = mapped_column(StringArray, default=list)  # roster badge labels
+    bio_status: Mapped[str] = mapped_column(Text, default="approved")  # approved | pending
+    bio_reviewed_label: Mapped[Optional[str]] = mapped_column(Text)    # "Apr 2026", "Jun 2026 (hire)"
+    bio_submitted_label: Mapped[Optional[str]] = mapped_column(Text)   # "Jun 22, 2026"
+    pending_bio: Mapped[Optional[dict]] = mapped_column(JSONBType())   # the submitted update card, or null
 
     shift_start: Mapped[Optional[time]] = mapped_column(Time)
     shift_end: Mapped[Optional[time]] = mapped_column(Time)
@@ -438,6 +531,35 @@ class TechCategoryFamiliarity(Base):
     first_time_fix: Mapped[Optional[float]] = mapped_column(Numeric)
     last_performed_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime)
     computed_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class AdvisorScore(Base):
+    """Advisor performance for the Service Scoreboard (advisor board).
+
+    V1 has no live advisor/CSI data source, so these rows are seeded for the
+    demo. Kept as real DB rows (not UI mock) so the board renders from data and
+    a real CSI/DMS feed can later replace the seed.
+    """
+
+    __tablename__ = "advisor_scores"
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("dealers.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    csi: Mapped[Optional[float]] = mapped_column(Numeric)              # % (CSI out of 5 × 20)
+    survey_responses: Mapped[Optional[int]] = mapped_column(Integer)   # count, manual entry
+    survey_response_pct: Mapped[Optional[float]] = mapped_column(Numeric)  # %, manual entry
+    cp_ros: Mapped[Optional[int]] = mapped_column(Integer)            # customer-pay RO count
+    sales_ro: Mapped[Optional[float]] = mapped_column(Numeric)        # $ sales per RO (today)
+    sales_yest: Mapped[Optional[float]] = mapped_column(Numeric)
+    sales_lmo: Mapped[Optional[float]] = mapped_column(Numeric)       # last month
+    sales_pmo: Mapped[Optional[float]] = mapped_column(Numeric)       # prior month
+    recs_ro: Mapped[Optional[float]] = mapped_column(Numeric)         # recommendations per RO
+    hrs_vs_rec: Mapped[Optional[float]] = mapped_column(Numeric)      # hours vs recommended
+    video_sent: Mapped[Optional[float]] = mapped_column(Numeric)      # % ROs with a video
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
 class AuditLog(Base):

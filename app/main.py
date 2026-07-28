@@ -17,8 +17,10 @@ from .routers import (
     imports,
     mykaarma,
     repair_orders,
+    route_sheet,
     scoreboard,
     technicians,
+    timeline,
 )
 
 settings = get_settings()
@@ -72,6 +74,8 @@ for r in (
     scoreboard.router,
     dashboard.router,
     mykaarma.router,
+    timeline.router,
+    route_sheet.router,
     dev.router,
 ):
     app.include_router(r, prefix=settings.api_prefix)

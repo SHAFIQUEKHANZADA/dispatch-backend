@@ -111,18 +111,47 @@ async def connection_status(session: AsyncSession, dealer_id: uuid.UUID) -> dict
         out["message"] = str(e)
         return out
 
-    # 2. is the repair-order scope granted? Probe the DOCUMENTED Order v2
-    #    endpoint (read-by-UUID with a nil UUID). Today myKaarma returns a clean
-    #    403 "ApiScope does not exist" — the endpoint is real, the scope isn't.
+    # 2. repair-order access. Probe BOTH documented scopes:
+    #    * order.specific.search  -> lists/enumerates open ROs (specificSearch)
+    #    * order read-by-UUID      -> full order detail (global_order)
+    #    When search is granted, also report how many OPEN ROs the department has
+    #    right now, so the owner sees the live number he can pull onto the board.
     try:
-        granted = client.probe_ro_scope()
-        out["ro_scope_granted"] = granted
-        out["message"] = (
-            "Connected. Repair-order scope (Order v2 API) IS granted."
-            if granted
-            else "Connected, but the Order v2 (repair-order) scope is NOT provisioned for "
-            "this account yet — RO data falls back to CSV import. myKaarma must grant it."
-        )
+        search_granted = client.probe_search_scope()
+        read_granted = client.probe_ro_scope()
+        out["ro_search_scope_granted"] = search_granted
+        out["ro_scope_granted"] = search_granted or read_granted  # any RO access
+
+        open_count = None
+        if search_granted:
+            try:
+                data = client.search_orders(order_status="O", order_type="RO", size=1)
+                open_count = data.get("totalCount") or 0
+                out["open_ro_count"] = open_count
+            except MyKaarmaError:
+                pass
+
+        if search_granted:
+            if open_count is not None:
+                out["message"] = (
+                    f"Connected. Repair-order scopes granted — {open_count} open RO(s) "
+                    f"available to pull from myKaarma."
+                    if open_count
+                    else "Connected. Repair-order scopes granted — this department currently "
+                    "has 0 open ROs in myKaarma (nothing to pull yet)."
+                )
+            else:
+                out["message"] = "Connected. Repair-order search scope granted."
+        elif read_granted:
+            out["message"] = (
+                "Connected. Order read scope granted, but the order-search scope "
+                "(order.specific.search) is not — open ROs can't be auto-enumerated yet."
+            )
+        else:
+            out["message"] = (
+                "Connected, but the Order v2 repair-order scopes are NOT provisioned for "
+                "this account yet — RO data falls back to CSV import."
+            )
     except MyKaarmaError as e:
         out["ro_scope_granted"] = False
         out["message"] = f"Connected; RO scope probe failed: {e}"
@@ -204,16 +233,46 @@ async def sync_opcodes(session: AsyncSession, dealer_id: uuid.UUID) -> SyncResul
     return SyncResult(True, f"Synced {len(ops)} opcode(s): {added} new, {updated} updated{note}", detail)
 
 
+def list_open_ro_uuids(client: MyKaarmaClient, max_pages: int = 20) -> tuple[list[str], int]:
+    """Enumerate OPEN repair orders via the documented specificSearch endpoint.
+
+    Returns (order_uuids, total_count). Pages through the results (size 150) so a
+    busy shop's whole open board is captured, not just the first page.
+    """
+    uuids: list[str] = []
+    total = 0
+    page = 0
+    while page < max_pages:
+        data = client.search_orders(order_status="O", order_type="RO", page_no=page, size=150)
+        total = data.get("totalCount") or 0
+        orders = data.get("orders") or []
+        if not orders:
+            break
+        for o in orders:
+            ou = o.get("orderUuid") or o.get("orderUUID")
+            if ou:
+                uuids.append(ou)
+        if len(uuids) >= total or len(orders) < 150:
+            break
+        page += 1
+    return uuids, total
+
+
 async def sync_repair_orders(
     session: AsyncSession,
     dealer_id: uuid.UUID,
     order_uuids: Optional[list[str]] = None,
 ) -> SyncResult:
-    """Pull ROs from myKaarma (Order v2) and ingest them.
+    """Pull OPEN repair orders from myKaarma and ingest them onto the board.
 
-    Order v2 is read-by-UUID. Pass `order_uuids` to ingest specific orders. With
-    no UUIDs we report that ingestion is ready but enumeration is unavailable —
-    we never invent orders.
+    The proper flow (per the myKaarma Orders docs):
+      1. ENUMERATE open ROs via POST order/v2/.../order/specificSearch
+         (orderStatus=O, orderType=RO) — the documented list endpoint.
+      2. For each order UUID, READ the full order via GET global_order/{uuid}
+         (header + jobs[] + parts) and upsert it into repair_orders + ro_lines.
+
+    Passing `order_uuids` explicitly skips enumeration (e.g. a webhook handing us
+    one order). We never invent orders — an empty department ingests nothing.
     """
     creds = await resolve_creds(session, dealer_id)
     if creds is None:
@@ -221,37 +280,56 @@ async def sync_repair_orders(
 
     client = MyKaarmaClient(creds)
 
-    if not client.probe_ro_scope():
-        await _record(
-            session, dealer_id, status="RO_SCOPE_NOT_GRANTED",
-            detail={"endpoint": "order/v2/global_order", "reason": "ApiScope not provisioned"},
-            ro_scope=False,
-        )
-        await session.commit()
-        return SyncResult(
-            False,
-            "Order v2 (repair-order) scope not granted by myKaarma — RO data continues "
-            "to come from the CSV import.",
-            {"ro_scope_granted": False},
-        )
+    # --- 1. determine the set of orders to ingest --------------------------- #
+    total_open = None
+    if order_uuids is None:
+        if not client.probe_search_scope():
+            # search scope missing — fall back to read-by-UUID if THAT is granted
+            if not client.probe_ro_scope():
+                await _record(
+                    session, dealer_id, status="RO_SCOPE_NOT_GRANTED",
+                    detail={"reason": "neither order.specific.search nor order read scope provisioned"},
+                    ro_scope=False,
+                )
+                await session.commit()
+                return SyncResult(
+                    False,
+                    "myKaarma has not provisioned the repair-order scopes for this account — "
+                    "RO data continues to come from the CSV import.",
+                    {"ro_scope_granted": False},
+                )
+            await _record(
+                session, dealer_id, status="RO_SEARCH_SCOPE_MISSING", ro_scope=True,
+                detail={"note": "read scope granted but order.specific.search is not — pass UUIDs to ingest"},
+            )
+            await session.commit()
+            return SyncResult(
+                True,
+                "Read scope is granted but the order-search scope is not, so open ROs can't be "
+                "enumerated automatically. Ask myKaarma to grant 'order.specific.search', or pass "
+                "order UUIDs to ingest them directly.",
+                {"ro_scope_granted": True, "search_scope": False, "ingested": 0},
+            )
+        try:
+            order_uuids, total_open = list_open_ro_uuids(client)
+        except MyKaarmaError as e:
+            await _record(session, dealer_id, status="RO_ENUM_FAILED",
+                          detail={"error": str(e)[:200]}, ro_scope=True)
+            await session.commit()
+            return SyncResult(False, f"Open-RO enumeration failed: {e}", {"ro_scope_granted": True})
 
-    # Scope IS granted. Order v2 is read-by-UUID and myKaarma has not exposed an
-    # enumeration endpoint (every list/search variant 404s), so a full pull needs
-    # either that endpoint or webhooks. Until then we ingest the UUIDs we are
-    # given — which is a fully working path, just not a self-driving one.
+    # --- 2. read + ingest each order ---------------------------------------- #
     if not order_uuids:
         await _record(
-            session, dealer_id, status="RO_SCOPE_OK_NO_ENUMERATION",
-            detail={"note": "scope granted; no order enumeration endpoint available"},
-            ro_scope=True,
+            session, dealer_id, status="RO_SYNC_OK", ro_scope=True,
+            detail={"open_orders": total_open or 0, "ingested": 0},
         )
         await session.commit()
         return SyncResult(
             True,
-            "Order v2 scope IS granted and ingestion is ready. myKaarma exposes no order "
-            "list/search endpoint, so pass order UUIDs to ingest them (or ask myKaarma to "
-            "enable an enumeration endpoint / webhooks for an automatic pull).",
-            {"ro_scope_granted": True, "ingested": 0, "needs_enumeration": True},
+            f"Connected to myKaarma and the repair-order scopes are granted. This department "
+            f"currently reports {total_open or 0} open repair order(s) — nothing to ingest.",
+            {"ro_scope_granted": True, "search_scope": True, "open_orders": total_open or 0, "ingested": 0},
         )
 
     ingested, failed, drift = 0, [], []
@@ -271,18 +349,145 @@ async def sync_repair_orders(
 
     detail = {
         "ro_scope_granted": True,
+        "search_scope": True,
+        "open_orders": total_open,
         "ingested": ingested,
         "failed": failed,
         "dms_mismatches": drift,
     }
     await _record(session, dealer_id, status="RO_SYNC_OK", detail=detail, ro_scope=True)
     await session.commit()
-    msg = f"Ingested {ingested} repair order(s) from myKaarma."
+    msg = f"Ingested {ingested} open repair order(s) from myKaarma."
     if failed:
         msg += f" {len(failed)} failed."
     if drift:
         msg += f" {len(drift)} DMS assignment mismatch(es) flagged."
     return SyncResult(True, msg, detail)
+
+
+def _map_appointment(a: dict) -> dict:
+    """One myKaarma serviceAppointment -> the shape the Upcoming ROs tab renders."""
+    cust = a.get("customerInformation") or {}
+    veh = a.get("vehicleInformation") or {}
+    order = a.get("orderInformation") or {}
+    name = f"{cust.get('firstName') or ''} {cust.get('lastName') or ''}".strip() or "Customer"
+
+    # Only build a vehicle string if a real make/model was chosen — otherwise the
+    # customer booked without selecting one, so show "Vehicle TBD" (not a bare year).
+    has_real_vehicle = (veh.get("brand") not in (None, "", "Other")) or (
+        veh.get("model") not in (None, "", "No Vehicle Selected")
+    )
+    if has_real_vehicle:
+        veh_parts = [str(veh[k]) for k in ("year", "brand", "model")
+                     if veh.get(k) and str(veh[k]) not in ("Other", "No Vehicle Selected", "trim")]
+        vehicle = " ".join(veh_parts) or "Vehicle TBD"
+    else:
+        vehicle = "Vehicle TBD"
+
+    transport = (a.get("transportOption") or {}).get("altTransportation")
+
+    # what the customer is coming in for: prefer the structured serviceList,
+    # else the free-text "comments" (the voice agent writes it there).
+    services = []
+    for sv in a.get("serviceList") or []:
+        if isinstance(sv, dict):
+            nm = sv.get("name") or sv.get("opCodeName") or sv.get("description")
+            if nm:
+                services.append(str(nm))
+    comments = (a.get("comments") or "").strip()
+    if services:
+        service_requested = ", ".join(services)
+    elif comments.lower().startswith("service requested"):
+        service_requested = comments.split(":", 1)[-1].strip() or None
+    else:
+        service_requested = comments or None
+
+    comm = a.get("appointmentCommunicationPreferences") or {}
+    trim = veh.get("trim")
+    return {
+        "appointment_uuid": a.get("uuid"),
+        "customer_name": name,
+        "company": cust.get("company") or None,
+        "phone": cust.get("confirmationPhone") or comm.get("confirmationPhoneNumber"),
+        "email": cust.get("confirmationEmail") or comm.get("confirmationEmail"),
+        "vehicle": vehicle,
+        "vin": veh.get("vin"),
+        "license_plate": veh.get("licensePlate"),
+        "mileage": veh.get("mileage") or a.get("mileageText"),
+        "color": veh.get("color"),
+        "engine": veh.get("engine"),
+        "trim": trim if trim not in (None, "", "trim") else None,
+        "start_time": a.get("startTime"),        # "2026-07-28 10:00:00"
+        "end_time": a.get("endTime"),
+        "preferred_date": a.get("preferredDate"),
+        "status": a.get("newStatus") or a.get("status"),
+        "transport": transport,
+        "service_requested": service_requested,
+        "internal_notes": (a.get("internalNotes") or "").strip() or None,
+        "recall": bool(a.get("recall")),
+        "source": a.get("appointmentSource") or a.get("platform"),
+        "text_reminder": bool(comm.get("textReminder")),
+        "advisor_uuid": a.get("assignedAdvisorUuid"),
+        "order_number": order.get("orderNumber"),
+        "has_order": bool(order.get("uuid")),
+        "booked_at": a.get("date"),              # when the appointment was created
+    }
+
+
+async def upcoming_appointments(
+    session: AsyncSession, dealer_id: uuid.UUID, days: int = 14
+) -> dict:
+    """Booked appointments from today through +`days` (the voice-agent bookings).
+
+    Reads the myKaarma Scheduler day-by-day (appointment.get) across the window,
+    concurrently, and returns them sorted by start time. These are "upcoming ROs"
+    — a booked appointment becomes a repair order when the customer checks in.
+    """
+    import asyncio
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    from ..clock import default_now
+    from ..models import Dealer
+
+    creds = await resolve_creds(session, dealer_id)
+    if creds is None:
+        return {"available": False, "reason": "No myKaarma credentials for this dealer.", "appointments": []}
+
+    client = MyKaarmaClient(creds)
+    if not client.probe_appointment_scope():
+        return {
+            "available": False,
+            "reason": "myKaarma has not granted the appointment.get scope for this account.",
+            "appointments": [],
+        }
+
+    dealer = await session.get(Dealer, dealer_id)
+    tz = ZoneInfo(dealer.timezone) if dealer and dealer.timezone else ZoneInfo("America/Chicago")
+    today = default_now().astimezone(tz).date()
+    dates = [(today + timedelta(days=n)).isoformat() for n in range(max(1, days) + 1)]
+
+    def fetch(d: str):
+        try:
+            return client.get_appointments(d).get("serviceAppointments") or []
+        except MyKaarmaError:
+            return []
+
+    # day queries run concurrently in threads (the client is sync httpx)
+    per_day = await asyncio.gather(*[asyncio.to_thread(fetch, d) for d in dates])
+
+    appts: list[dict] = []
+    for day in per_day:
+        for a in day:
+            appts.append(_map_appointment(a))
+    appts.sort(key=lambda x: x.get("start_time") or "")
+
+    return {
+        "available": True,
+        "count": len(appts),
+        "window_days": days,
+        "appointments": appts,
+    }
 
 
 def _dec(value: float) -> Decimal:

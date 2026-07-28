@@ -27,9 +27,9 @@ TABS = [
 
 SORTS = {
     "flagged_written": "Flagged first, then earliest written (default)",
-    "promise": "Promise time, soonest first",
     "written": "Earliest written",
-    "priority": "Priority, highest first",
+    "latest_written": "Latest written",
+    "ro_number": "RO number",
 }
 
 _PRIORITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
@@ -71,19 +71,12 @@ def _sort_ros(ros: list[RepairOrder], sort: str) -> list[RepairOrder]:
     far_future = datetime.max.replace(tzinfo=timezone.utc)
     far_past = datetime.min.replace(tzinfo=timezone.utc)
 
-    if sort == "promise":
-        return sorted(ros, key=lambda r: (r.promise_at or far_future, r.ro_number))
     if sort == "written":
         return sorted(ros, key=lambda r: (r.written_at or far_future, r.ro_number))
-    if sort == "priority":
-        return sorted(
-            ros,
-            key=lambda r: (
-                _PRIORITY_ORDER.get(r.priority, 3),
-                r.written_at or far_future,
-                r.ro_number,
-            ),
-        )
+    if sort == "latest_written":
+        return sorted(ros, key=lambda r: (r.written_at or far_past, r.ro_number), reverse=True)
+    if sort == "ro_number":
+        return sorted(ros, key=lambda r: r.ro_number)
     # default — flagged first, then earliest written
     return sorted(
         ros,

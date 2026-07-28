@@ -375,9 +375,9 @@ def test_the_reasons_read_like_the_spec():
     c = score_technician(r, tech(), ctx())
     text = " | ".join(x.text for x in c.reasons)
     assert "HV/EV certified (required for this RO)" in text
-    assert "Completed 317 similar Electrical/AC repairs" in text
+    assert "317 ROs in 90 days" in text          # familiarity, narrative phrasing
     assert "112% efficiency" in text
-    assert "Available in 12 minutes" in text
+    assert "Frees up in ~10 min" in text          # availability (12 min -> rounded to 5)
     assert "promise" in text.lower()
 
 

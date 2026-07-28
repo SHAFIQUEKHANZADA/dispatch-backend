@@ -192,3 +192,90 @@ class MyKaarmaClient:
             if "ORDER_NOT_FOUND" in str(e).upper() or "NOT FOUND WITH UUID" in str(e).upper():
                 return True
             raise
+
+    # --------------------------------------------------------------------- #
+    # RO enumeration — the DOCUMENTED search endpoint.                        #
+    # POST /order/v2/department/{dept}/order/specificSearch                   #
+    # Scope: order.specific.search (DealerDepartment level).                  #
+    # This is how open repair orders are LISTED (not read-by-UUID). The       #
+    # response carries customer + vehicle + advisor + promise + tech uuids.   #
+    # https://docs.mykaarma.com/our-products/orders/order/                    #
+    # --------------------------------------------------------------------- #
+
+    def search_orders(
+        self,
+        *,
+        order_status: Optional[str] = None,   # "O" open, "P" pre-invoiced, "C" closed
+        order_type: str = "RO",               # RO repair order, PO parts order
+        from_order_date: Optional[str] = None,  # yyyy-MM-dd
+        to_order_date: Optional[str] = None,
+        date_filter_type: Optional[str] = None,  # ORDER_DATE|CLOSE_DATE|CREATED_DATE|UPDATED_DATE
+        order_number_prefix: Optional[str] = None,
+        page_no: int = 0,
+        size: int = 150,
+    ) -> dict:
+        """POST specificSearch — the list/enumeration endpoint. Returns
+        {"orders": [...], "totalCount": N}. Only non-null filters are sent."""
+        body: dict[str, Any] = {"orderType": order_type, "pageNo": str(page_no), "size": str(size)}
+        if order_status:
+            body["orderStatus"] = order_status
+        if date_filter_type:
+            body["dateFilterType"] = date_filter_type
+        if from_order_date:
+            body["fromOrderDate"] = from_order_date
+        if to_order_date:
+            body["toOrderDate"] = to_order_date
+        if order_number_prefix:
+            body["orderNumberPrefix"] = order_number_prefix
+        return self._post(
+            f"/order/v2/department/{self.creds.department_uuid}/order/specificSearch",
+            body,
+            "search_orders",
+        )
+
+    # --------------------------------------------------------------------- #
+    # Appointments (Scheduler v2) — booked/upcoming appointments by date.     #
+    # GET /appointment/v2/dealerDepartment/{dept}/date/{yyyy-MM-dd}           #
+    # Scope: appointment.get. This is how a voice-agent-booked appointment    #
+    # (customer + date/time) is read back into the app as an "upcoming RO".   #
+    # --------------------------------------------------------------------- #
+
+    def get_appointments(self, date: str) -> dict:
+        """Appointments booked for a given date. `date` is yyyy-MM-dd.
+
+        Returns {"serviceAppointments": [...]}. Each entry carries
+        customerInformation, vehicleInformation, orderInformation, startTime,
+        endTime, newStatus, assignedAdvisorUuid, transportOption.
+        """
+        return self._get(
+            f"/appointment/v2/dealerDepartment/{self.creds.department_uuid}/date/{date}",
+            "get_appointments",
+        )
+
+    def probe_appointment_scope(self) -> bool:
+        """True if the appointment.get scope is granted."""
+        try:
+            self.get_appointments("2000-01-01")
+            return True
+        except ScopeNotGrantedError:
+            return False
+        except MyKaarmaError:
+            return True  # endpoint answered (business/empty) => scope is fine
+
+    def probe_search_scope(self) -> bool:
+        """True if the order.specific.search scope is granted (open-RO listing).
+
+        A granted account answers with JSON (an orders array, possibly empty). A
+        non-provisioned one returns the 403 ApiScope / HTML login signal.
+        """
+        try:
+            self.search_orders(order_status="O", order_type="RO", size=1)
+            return True
+        except ScopeNotGrantedError:
+            return False
+        except MyKaarmaError as e:
+            # a business/validation error still means the endpoint answered us
+            up = str(e).upper()
+            if "SCOPE" in up and ("NOT" in up or "DOES NOT" in up):
+                return False
+            return True

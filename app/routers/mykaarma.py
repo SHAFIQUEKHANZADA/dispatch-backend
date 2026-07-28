@@ -11,6 +11,7 @@ from ..mykaarma.connector import (
     connection_status,
     sync_opcodes,
     sync_repair_orders,
+    upcoming_appointments,
 )
 
 router = APIRouter(prefix="/mykaarma", tags=["mykaarma"])
@@ -24,6 +25,16 @@ async def status(session: SessionDep, current: CurrentUserDep):
     badge on the Import screen.
     """
     return await connection_status(session, current.dealer_id)
+
+
+@router.get("/appointments/upcoming")
+async def upcoming(session: SessionDep, current: CurrentUserDep, days: int = 14):
+    """Upcoming appointments booked in myKaarma (e.g. by the voice agent).
+
+    Shown on the Available ROs → Upcoming ROs tab so the owner can watch a
+    booking flow straight from the app.
+    """
+    return await upcoming_appointments(session, current.dealer_id, days)
 
 
 @router.post("/sync/opcodes")
@@ -47,9 +58,9 @@ class SyncROsRequest(BaseModel):
     order_uuids: list[str] = Field(
         default_factory=list,
         description=(
-            "myKaarma Order v2 UUIDs to ingest. Order v2 is read-by-UUID and "
-            "myKaarma exposes no list endpoint, so supply the UUIDs (or wire "
-            "webhooks) until an enumeration endpoint is available."
+            "Optional: specific myKaarma Order v2 UUIDs to ingest (e.g. from a "
+            "webhook). Leave empty to AUTO-ENUMERATE all open ROs via the "
+            "specificSearch endpoint and ingest them."
         ),
     )
 
@@ -60,11 +71,15 @@ async def sync_ros_route(
     current: CurrentUserDep,
     body: SyncROsRequest | None = None,
 ):
-    """Pull repair orders from myKaarma (Order v2) and ingest them into the board."""
+    """Pull open repair orders from myKaarma and ingest them into the board.
+
+    With no order_uuids it enumerates every open RO (specificSearch) and ingests
+    them; pass explicit UUIDs to ingest just those.
+    """
     current.require_role("SERVICE_MANAGER")
-    result = await sync_repair_orders(
-        session, current.dealer_id, (body.order_uuids if body else None)
-    )
+    # empty list -> auto-enumerate (None); only a non-empty list targets specific orders
+    uuids = body.order_uuids if (body and body.order_uuids) else None
+    result = await sync_repair_orders(session, current.dealer_id, uuids)
     await audit.record(
         session,
         dealer_id=current.dealer_id,

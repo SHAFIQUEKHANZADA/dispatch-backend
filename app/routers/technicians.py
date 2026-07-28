@@ -20,7 +20,14 @@ from ..models import (
     TechnicianRestriction,
     TechnicianSpecialty,
 )
-from ..services.dispatch_service import load_shop
+from ..services.dispatch_service import (
+    load_shop,
+    rank_for_ro,
+    ro_to_input,
+    techs_for_ro,
+)
+from ..engine.match_score import check_hard_constraints, score_technician
+from ..models import RepairOrder
 
 router = APIRouter(prefix="/technicians", tags=["technicians"])
 
@@ -102,6 +109,25 @@ class TechnicianIn(BaseModel):
     specialties: list[SpecialtyIn] = Field(default_factory=list)
 
 
+# engine skill_level (a SKILL_RANKS key) -> the owner's roster role label
+_ROLE_LABEL = {
+    "Sr. Master": "Senior Master",
+    "Master": "Master",
+    "Diagnostic Tech": "L5 Apprentice",
+    "General Tech": "L4 Apprentice",
+    "Apprentice 3": "L3 Apprentice",
+    "Apprentice 2": "L2 Apprentice",
+    "Apprentice 1": "L1 Apprentice",
+}
+_TEAM_LABEL = {"Main": "Main Shop", "Lube": "Lube Team"}
+
+
+def role_label(t: Technician) -> str:
+    if t.team == "Lube":
+        return "Lube Tech"
+    return _ROLE_LABEL.get(t.skill_level or "", t.skill_level or "—")
+
+
 def _tech_dict(t: Technician) -> dict:
     return {
         "id": str(t.id),
@@ -109,7 +135,15 @@ def _tech_dict(t: Technician) -> dict:
         "employee_id": t.employee_id,
         "dms_tech_no": t.dms_tech_no,
         "team": t.team,
+        "team_label": _TEAM_LABEL.get(t.team or "", t.team or "—"),
         "skill_level": t.skill_level,
+        "role_label": role_label(t),
+        "hourly_rate": float(t.hourly_rate) if t.hourly_rate is not None else None,
+        "cert_badges": list(t.cert_badges or []),
+        "bio_status": t.bio_status,
+        "bio_reviewed_label": t.bio_reviewed_label,
+        "bio_submitted_label": t.bio_submitted_label,
+        "has_pending_bio": bool(t.pending_bio),
         "active": t.active,
         "shift_start": t.shift_start.isoformat() if t.shift_start else None,
         "shift_end": t.shift_end.isoformat() if t.shift_end else None,
@@ -160,6 +194,146 @@ async def list_technicians(
         q = q.where(Technician.active.is_(True))
     techs = list((await session.execute(q.order_by(Technician.name))).scalars())
     return {"technicians": [_tech_dict(t) for t in techs]}
+
+
+_PRIORITY_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+
+
+@router.get("/recommendations")
+async def tech_recommendations(session: SessionDep, current: CurrentUserDep):
+    """Available-Techs board: for each free/soon-free tech, the Ready-to-Dispatch
+    ROs ranked by THAT tech's Match Score (not just global priority).
+
+    The inverse of the dispatch board. Same deterministic engine — we just pivot:
+    score every eligible (tech, RO) pair, then group by tech.
+    """
+    shop = await load_shop(session, current.dealer_id)
+    from datetime import datetime, timezone
+
+    ready = list(
+        (
+            await session.execute(
+                select(RepairOrder).where(
+                    RepairOrder.dealer_id == current.dealer_id,
+                    RepairOrder.status == "READY_TO_DISPATCH",
+                )
+            )
+        ).scalars()
+    )
+
+    # global priority rank of each RO (flagged first, then priority, then written)
+    far = datetime.max.replace(tzinfo=timezone.utc)
+    ordered = sorted(
+        ready,
+        key=lambda r: (
+            0 if r.is_flagged else 1,
+            _PRIORITY_RANK.get(r.priority, 3),
+            r.written_at or far,
+            r.ro_number,
+        ),
+    )
+    priority_rank = {r.id: i + 1 for i, r in enumerate(ordered)}
+
+    # best-fit tech per RO (for the insight banner)
+    best_tech_for_ro: dict = {}
+    for ro in ready:
+        rk = rank_for_ro(shop, ro, top_n=1)
+        if rk.candidates:
+            best_tech_for_ro[ro.id] = rk.candidates[0].name
+
+    # score every eligible (tech, RO) pair, grouped by tech
+    per_tech: dict = {t.id: [] for t in shop.technicians}
+    for ro in ready:
+        ro_in = ro_to_input(ro)
+        ctx = shop.context(ro.concern_category)
+        for tech_input in techs_for_ro(shop, ro):
+            if check_hard_constraints(ro_in, tech_input, ctx) is not None:
+                continue
+            cand = score_technician(ro_in, tech_input, ctx)
+            per_tech[uuid.UUID(tech_input.id)].append((ro, cand))
+
+    out = []
+    available_freeing = 0
+    now = shop.now
+    for t in shop.technicians:
+        ti = shop.tech_inputs[t.id]
+        if not (ti.on_shift and ti.active):
+            continue
+
+        # status
+        assigned = shop.assigned_hours.get(t.id, 0.0)
+        if ti.idle if hasattr(ti, "idle") else (assigned <= 0.01 and not shop.current_ro.get(t.id)):
+            status = {"kind": "idle", "text": "IDLE"}
+        elif ti.free_at and ti.free_at <= now:
+            status = {"kind": "available", "text": "AVAILABLE NOW"}
+        elif ti.free_at:
+            mins = int(round((ti.free_at - now).total_seconds() / 60.0))
+            status = {"kind": "freeing", "text": f"FREES IN ~{max(5, mins)} MIN"}
+        else:
+            status = {"kind": "available", "text": "AVAILABLE NOW"}
+        if status["kind"] in ("available", "freeing", "idle"):
+            available_freeing += 1
+
+        recs = sorted(per_tech[t.id], key=lambda pair: -pair[1].score)[:3]
+        ro_rows = []
+        for ro, cand in recs:
+            ro_rows.append({
+                "ro_id": str(ro.id),
+                "ro_number": ro.ro_number,
+                "vehicle": " ".join(str(x) for x in (ro.vehicle_year, ro.vehicle_make, ro.vehicle_model) if x),
+                "concern": ro.concern_category,
+                "concern_short": (ro.lines[0].description if ro.lines else ro.concern_category),
+                "priority_rank": priority_rank.get(ro.id),
+                "score": cand.score,
+                "reasons": [r.to_dict() for r in cand.reasons if r.text],
+                "warnings": cand.warnings,
+                "technician_id": str(t.id),
+            })
+
+        # insight banner — real observation about this tech's routing
+        insight = None
+        if ro_rows:
+            top = recs[0][0]
+            top_row = ro_rows[0]
+            # is there a higher-priority RO that went to a better-fit tech?
+            higher = [r for r in ordered if priority_rank[r.id] < (top_row["priority_rank"] or 99)]
+            stolen = next(
+                (r for r in higher if best_tech_for_ro.get(r.id) and best_tech_for_ro[r.id] != t.name),
+                None,
+            )
+            if stolen is not None:
+                insight = (
+                    f"#{priority_rank[stolen.id]} priority (RO #{stolen.ro_number} "
+                    f"{stolen.concern_category}) is a better fit for {best_tech_for_ro[stolen.id]} — "
+                    f"so {t.name.split()[0]} is matched to the {top.concern_category} they fit best."
+                )
+            else:
+                insight = f"{t.name.split()[0]} is the best fit for RO #{top.ro_number} ({top.concern_category})."
+
+        cert_badge = None
+        if any(c in ti.certs for c in ("HV_EV", "HYBRID")):
+            cert_badge = "HV"
+        elif t.team == "Lube":
+            cert_badge = "LUBE TEAM"
+
+        out.append({
+            "id": str(t.id),
+            "name": t.name,
+            "initials": "".join(p[0] for p in t.name.split()[:2]).upper(),
+            "level": t.skill_level or "Tech",
+            "status": status,
+            "cert_badge": cert_badge,
+            "insight": insight,
+            "ros": ro_rows,
+        })
+
+    # available/freeing techs first
+    out.sort(key=lambda x: (0 if x["status"]["kind"] in ("available", "freeing") else 1, x["name"]))
+
+    return {
+        "counters": {"available_freeing": available_freeing, "unassigned_ros": len(ready)},
+        "techs": out,
+    }
 
 
 @router.get("/available")
@@ -222,6 +396,86 @@ async def available_technicians(session: SessionDep, current: CurrentUserDep):
         )
 
     return {"technicians": out}
+
+
+# --------------------------------------------------------------------------- #
+# Bio-approval workflow (Tech Settings)                                        #
+# NOTE: declared BEFORE /{tech_id} so "bio-updates" isn't parsed as a UUID.    #
+# --------------------------------------------------------------------------- #
+
+@router.get("/bio-updates")
+async def bio_updates(session: SessionDep, current: CurrentUserDep):
+    """Techs who have submitted a bio update awaiting manager approval."""
+    techs = list((await session.execute(
+        select(Technician).where(
+            Technician.dealer_id == current.dealer_id,
+            Technician.bio_status == "pending",
+            Technician.pending_bio.isnot(None),
+        )
+    )).scalars())
+    techs.sort(key=lambda t: t.bio_submitted_label or "", reverse=True)  # most recent first
+    updates = [
+        {
+            "id": str(t.id),
+            "name": t.name,
+            "role_label": role_label(t),
+            "submitted_label": t.bio_submitted_label,
+            "bio": t.pending_bio,
+        }
+        for t in techs
+    ]
+    return {"pending": len(updates), "updates": updates}
+
+
+@router.post("/{tech_id}/bio/{action}")
+async def act_on_bio(
+    tech_id: uuid.UUID, action: str, session: SessionDep, current: CurrentUserDep
+):
+    """Approve / reject / request-changes on a pending bio update.
+
+    Approve applies the submitted cert badges to the roster and marks the bio
+    approved (so it flows into scoring); the others just clear the pending state
+    with the recorded outcome.
+    """
+    current.require_role("SERVICE_MANAGER")
+    if action not in {"approve", "reject", "request-changes"}:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "unknown action")
+    t = await session.get(Technician, tech_id)
+    if t is None or t.dealer_id != current.dealer_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Technician not found")
+
+    from ..clock import default_now
+    reviewed = default_now().strftime("%b %Y")
+
+    if action == "approve":
+        bio = t.pending_bio or {}
+        # fold any newly-attached ASE certs into the roster badges
+        added = [a.get("code") for a in bio.get("ase_added", []) if a.get("code")]
+        if added:
+            badges = list(t.cert_badges or [])
+            for code in added:
+                tag = f"ASE {code}"
+                if tag not in badges:
+                    badges.append(tag)
+            t.cert_badges = badges
+        t.bio_status = "approved"
+        t.bio_reviewed_label = reviewed
+        t.pending_bio = None
+    elif action == "reject":
+        t.bio_status = "approved"        # reverts to the last approved bio
+        t.bio_reviewed_label = reviewed
+        t.pending_bio = None
+    else:  # request-changes — bounce back to the tech, keep it out of the queue
+        t.bio_status = "changes_requested"
+        t.pending_bio = None
+
+    await audit.record(
+        session, dealer_id=current.dealer_id, actor=current.user_id,
+        action=audit.SETTINGS_UPDATED, entity="technician_bio", entity_id=t.id,
+        payload={"action": action, "name": t.name},
+    )
+    await session.commit()
+    return {"id": str(t.id), "bio_status": t.bio_status, "action": action}
 
 
 @router.get("/{tech_id}")
