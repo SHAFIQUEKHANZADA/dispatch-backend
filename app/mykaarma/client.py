@@ -252,6 +252,30 @@ class MyKaarmaClient:
             "get_appointments",
         )
 
+    def get_customer(self, customer_uuid: str) -> dict:
+        """Full customer record (phone numbers + emails live here, not on the
+        appointment). GET /customer/v2/department/{dept}/customer/{uuid}."""
+        return self._get(
+            f"/customer/v2/department/{self.creds.department_uuid}/customer/{customer_uuid}",
+            "get_customer",
+        )
+
+    def search_customers(self, term: str) -> list[dict]:
+        """READ-ONLY customer search (scope customer.search). Returns
+        `matchingCustomers`, each with communications[] (phone/email) AND
+        vehicles[] (year/make/model/vin/uuid) — the real per-customer vehicle.
+
+        NB: this is the GET listMinimal endpoint. NEVER use the customer POST
+        (save_customer) to "look up" a customer — it WRITES and creates blank
+        duplicate records on every call.
+        """
+        data = self._get(
+            f"/customer/v2/department/{self.creds.department_uuid}/customer/listMinimal",
+            "search_customers",
+            params={"searchTerm": term},
+        )
+        return data.get("matchingCustomers") or []
+
     def probe_appointment_scope(self) -> bool:
         """True if the appointment.get scope is granted."""
         try:

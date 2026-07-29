@@ -386,19 +386,25 @@ def _map_appointment(a: dict) -> dict:
 
     transport = (a.get("transportOption") or {}).get("altTransportation")
 
-    # what the customer is coming in for: prefer the structured serviceList,
-    # else the free-text "comments" (the voice agent writes it there).
+    # Op-code line items the customer booked (the real DMS operations).
     services = []
     for sv in a.get("serviceList") or []:
-        if isinstance(sv, dict):
-            nm = sv.get("name") or sv.get("opCodeName") or sv.get("description")
-            if nm:
-                services.append(str(nm))
+        if not isinstance(sv, dict):
+            continue
+        services.append({
+            "op_code": sv.get("laborOpCode") or sv.get("opCode"),
+            "description": sv.get("description") or sv.get("opCodeName") or sv.get("name"),
+            "duration_mins": sv.get("durationInMins"),
+            "price": sv.get("price"),
+            "pay_type": (sv.get("payType") or "").strip() or None,
+            "operation_type": sv.get("operationType"),
+        })
+
     comments = (a.get("comments") or "").strip()
     if services:
-        service_requested = ", ".join(services)
+        service_requested = ", ".join(s["description"] for s in services if s.get("description"))
     elif comments.lower().startswith("service requested"):
-        service_requested = comments.split(":", 1)[-1].strip() or None
+        service_requested = comments.split(":", 1)[-1].split("|")[0].strip() or None
     else:
         service_requested = comments or None
 
@@ -406,11 +412,15 @@ def _map_appointment(a: dict) -> dict:
     trim = veh.get("trim")
     return {
         "appointment_uuid": a.get("uuid"),
+        "customer_uuid": cust.get("uuid"),
         "customer_name": name,
         "company": cust.get("company") or None,
+        # appointment-level confirmation contact (often null); enriched below from
+        # the customer record when missing.
         "phone": cust.get("confirmationPhone") or comm.get("confirmationPhoneNumber"),
         "email": cust.get("confirmationEmail") or comm.get("confirmationEmail"),
         "vehicle": vehicle,
+        "vehicle_uuid": veh.get("uuid"),
         "vin": veh.get("vin"),
         "license_plate": veh.get("licensePlate"),
         "mileage": veh.get("mileage") or a.get("mileageText"),
@@ -423,6 +433,7 @@ def _map_appointment(a: dict) -> dict:
         "status": a.get("newStatus") or a.get("status"),
         "transport": transport,
         "service_requested": service_requested,
+        "services": services,
         "internal_notes": (a.get("internalNotes") or "").strip() or None,
         "recall": bool(a.get("recall")),
         "source": a.get("appointmentSource") or a.get("platform"),
@@ -480,14 +491,82 @@ async def upcoming_appointments(
     for day in per_day:
         for a in day:
             appts.append(_map_appointment(a))
-    appts.sort(key=lambda x: x.get("start_time") or "")
 
+    # Resolve each appointment's OWN customer record (read-only listMinimal) to
+    # get real phone/email + the customer's real vehicle. One search per unique
+    # customer, run concurrently, disambiguated back to the exact customer UUID.
+    by_uuid: dict[str, str] = {}
+    for a in appts:
+        cu = a.get("customer_uuid")
+        if cu and cu not in by_uuid:
+            by_uuid[cu] = a.get("customer_name") or ""
+
+    def lookup(cu: str, name: str):
+        try:
+            term = (name.split()[0] if name else "") or name
+            matches = client.search_customers(term)
+            # exact match on the appointment's customer UUID (handles same-name dupes)
+            cust = next((m for m in matches if m.get("uuid") == cu), None)
+            return cu, cust
+        except MyKaarmaError:
+            return cu, None
+
+    if by_uuid:
+        pairs = await asyncio.gather(*[asyncio.to_thread(lookup, cu, nm) for cu, nm in by_uuid.items()])
+        records = {cu: cust for cu, cust in pairs if cust}
+        for a in appts:
+            cust = records.get(a.get("customer_uuid"))
+            if not cust:
+                continue
+            phone, email = _contact_from_comms(cust)
+            a["phone"] = a.get("phone") or phone
+            a["email"] = a.get("email") or email
+            # the customer's real vehicle, matched to this appointment
+            v = _pick_vehicle(cust, a.get("vehicle_uuid"))
+            if v:
+                yr, mk, md = v.get("year"), v.get("make"), v.get("model")
+                a["vehicle"] = " ".join(str(x) for x in (yr, mk, md) if x) or a["vehicle"]
+                a["vin"] = v.get("vin") or a.get("vin")
+
+    appts.sort(key=lambda x: x.get("start_time") or "")
     return {
         "available": True,
         "count": len(appts),
         "window_days": days,
         "appointments": appts,
     }
+
+
+def _is_junk_vehicle(v: dict) -> bool:
+    return (v.get("model") == "No Vehicle Selected") or (v.get("make") == "Other")
+
+
+def _pick_vehicle(cust: dict, appt_vehicle_uuid: Optional[str]) -> Optional[dict]:
+    """The customer's real vehicle for this appointment: match the appointment's
+    vehicle UUID (unless it points at a junk placeholder), else the newest valid
+    vehicle. Junk 'No Vehicle Selected' / 'Other' entries are never returned."""
+    valid = [v for v in (cust.get("vehicles") or []) if not _is_junk_vehicle(v)]
+    if not valid:
+        return None
+    if appt_vehicle_uuid:
+        for v in valid:
+            if v.get("uuid") == appt_vehicle_uuid:
+                return v
+    return sorted(valid, key=lambda v: str(v.get("year") or ""), reverse=True)[0]
+
+
+def _contact_from_comms(cust: dict) -> tuple[Optional[str], Optional[str]]:
+    """First phone + email from a listMinimal customer's communications[]."""
+    phone = email = None
+    for cm in cust.get("communications") or []:
+        val = (cm.get("commValue") or "").strip()
+        if not val:
+            continue
+        if "@" in val:
+            email = email or val
+        elif (cm.get("commType") or "").upper() == "P" or val.replace("+", "").isdigit():
+            phone = phone or val
+    return phone, email
 
 
 def _dec(value: float) -> Decimal:
