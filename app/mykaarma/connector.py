@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import get_settings
 from ..models import (
     Assignment,
+    Dealer,
     MyKaarmaDealer,
     OpCodeMap,
     RepairOrder,
@@ -49,7 +50,14 @@ class SyncResult:
 
 
 async def resolve_creds(session: AsyncSession, dealer_id: uuid.UUID) -> Optional[MyKaarmaCreds]:
-    """Per-dealer row first, then env fallback. None if neither is configured."""
+    """Each store uses its OWN myKaarma credentials — this is the multi-tenant
+    boundary. Resolution order:
+      1. the store's row in mykaarma_dealers (per-store creds), else
+      2. the env creds — but ONLY for the single designated default store
+         (settings.mykaarma_default_store_key), so one store's credentials can
+         NEVER be used to pull another store's data.
+    Returns None when the store has no credentials configured.
+    """
     row = await session.get(MyKaarmaDealer, dealer_id)
     if row and row.enabled:
         return MyKaarmaCreds(
@@ -59,13 +67,25 @@ async def resolve_creds(session: AsyncSession, dealer_id: uuid.UUID) -> Optional
             department_uuid=row.department_uuid,
         )
     if settings.mykaarma_env_configured:
-        return MyKaarmaCreds(
-            username=settings.mykaarma_username,
-            password=settings.mykaarma_password,
-            dealer_uuid=settings.mykaarma_dealer_uuid,
-            department_uuid=settings.mykaarma_department_uuid,
-        )
+        dealer = await session.get(Dealer, dealer_id)
+        if dealer and dealer.dealer_key == settings.mykaarma_default_store_key:
+            return MyKaarmaCreds(
+                username=settings.mykaarma_username,
+                password=settings.mykaarma_password,
+                dealer_uuid=settings.mykaarma_dealer_uuid,
+                department_uuid=settings.mykaarma_department_uuid,
+            )
     return None
+
+
+async def resolve_creds_by_key(session: AsyncSession, dealer_key: str) -> Optional[MyKaarmaCreds]:
+    """Look up a store's myKaarma creds by its dealer_key (store_id)."""
+    dealer = (
+        await session.execute(select(Dealer).where(Dealer.dealer_key == dealer_key))
+    ).scalar_one_or_none()
+    if dealer is None:
+        return None
+    return await resolve_creds(session, dealer.id)
 
 
 async def _record(

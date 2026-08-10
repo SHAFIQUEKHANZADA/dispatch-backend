@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     mykaarma_password: str = ""
     mykaarma_dealer_uuid: str = ""
     mykaarma_department_uuid: str = ""
+    # The env creds above belong to exactly ONE store. This key names it, so the
+    # env fallback is applied ONLY to that store and never leaks to other tenants.
+    mykaarma_default_store_key: str = "mcgrath_honda_stcharles"
 
     @property
     def mykaarma_env_configured(self) -> bool:

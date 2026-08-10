@@ -19,6 +19,7 @@ from .routers import (
     repair_orders,
     route_sheet,
     scoreboard,
+    stores,
     technicians,
     timeline,
 )
@@ -76,6 +77,7 @@ for r in (
     mykaarma.router,
     timeline.router,
     route_sheet.router,
+    stores.router,
     dev.router,
 ):
     app.include_router(r, prefix=settings.api_prefix)

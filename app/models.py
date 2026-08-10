@@ -34,6 +34,10 @@ def _uuid() -> uuid.UUID:
 class Dealer(Base):
     __tablename__ = "dealers"
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)
+    # Stable human-readable store key (aka dealer_key / store_id). Matches the
+    # connector's keys, e.g. "mcgrath_honda_stcharles". Adding a store = adding a
+    # dealer row with a new key + its myKaarma creds — never a new deployment.
+    dealer_key: Mapped[Optional[str]] = mapped_column(Text, unique=True, index=True)
     name: Mapped[str] = mapped_column(Text, nullable=False)
     timezone: Mapped[str] = mapped_column(Text, default="America/Chicago")
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)

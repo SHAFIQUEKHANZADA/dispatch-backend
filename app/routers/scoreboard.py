@@ -102,7 +102,19 @@ async def _advisor_board(session, dealer_id) -> dict:
                 "video_sent": float(a.video_sent) if a.video_sent is not None else None,
             },
         })
-    rows.sort(key=lambda r: -(r["values"]["csi"] or 0))
+    # Rank by CSI when it's available; otherwise (DMS export has no CSI feed)
+    # rank by Sales/RO so the board surfaces top billers, not a random order.
+    rank_key = "csi" if any(r["values"].get("csi") is not None for r in rows) else "sales_ro"
+    # When ranking on Sales/RO, gate out tiny samples (an advisor with 1 RO at
+    # $1,000 shouldn't outrank one with 50 ROs) — low-volume advisors sort last.
+    min_ros = 5 if rank_key == "sales_ro" else 0
+
+    def a_sort(r):
+        v = r["values"].get(rank_key) or 0
+        qualifies = (r["values"].get("cp_ros") or 0) >= min_ros
+        return (0 if qualifies else 1, -v, r["name"])
+
+    rows.sort(key=a_sort)
     for i, r in enumerate(rows):
         r["rank"] = i + 1
 
@@ -120,7 +132,7 @@ async def _advisor_board(session, dealer_id) -> dict:
         "view": "advisors",
         "available": True,
         "period_label": "Last Business Day",
-        "rank_key": "csi",
+        "rank_key": rank_key,
         "columns": ADVISOR_COLUMNS,
         "rows": rows,
         "goals": {c["key"]: c["goal"] for c in ADVISOR_COLUMNS},
@@ -274,8 +286,11 @@ async def scoreboard_board(
     rows = []
     for c in result.cards:
         m = {k: getattr(c, k) for k in ("efficiency", "productivity", "comeback_rate")}
-        total_hours = c.clocked_hours
-        hrs_per_ro = (c.clocked_hours / c.ro_count) if c.ro_count else None
+        # "Total Hours" = flagged (billed) hours. Clock hours aren't in the DMS RO
+        # export (no attendance feed), so flagged hours are the real work signal;
+        # efficiency (flagged/clocked) stays unavailable until a clock feed lands.
+        total_hours = c.flagged_hours
+        hrs_per_ro = (c.flagged_hours / c.ro_count) if c.ro_count else None
         def rnd(mv):
             return round(mv.value, 1) if mv.available and mv.value is not None else None
 
@@ -296,6 +311,12 @@ async def scoreboard_board(
             "data_issues": c.data_issues,
             "values": values,
         })
+
+    # If no tech has an efficiency (no clock feed — e.g. a DMS RO-only export),
+    # rank by billed hours so the board still surfaces top performers first
+    # instead of falling back to alphabetical.
+    if not any(r["values"].get("efficiency") is not None for r in rows):
+        rank_key = "total_hours"
 
     # rank: qualified techs by the rank metric (desc), unqualified last
     def sort_key(r):

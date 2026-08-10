@@ -142,14 +142,48 @@ async def _supabase_user(session: AsyncSession, authorization: Optional[str]) ->
     return CurrentUser(user_id=user_id, dealer_id=profile.dealer_id, role=profile.role)
 
 
+async def _resolve_store_key(session: AsyncSession, store_key: Optional[str]) -> Optional[uuid.UUID]:
+    """Map a dealer_key (store_id) to its dealer_id, or None."""
+    if not store_key:
+        return None
+    row = (
+        await session.execute(select(Dealer.id).where(Dealer.dealer_key == store_key))
+    ).first()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown store '{store_key}'")
+    return row[0]
+
+
 async def get_current_user(
     session: Annotated[AsyncSession, Depends(get_session)],
     authorization: Annotated[Optional[str], Header()] = None,
     x_dealer_id: Annotated[Optional[str], Header()] = None,
+    x_store_key: Annotated[Optional[str], Header()] = None,
 ) -> CurrentUser:
+    # A selected store can be named by its key (X-Store-Key) or id (X-Dealer-Id).
+    target = await _resolve_store_key(session, x_store_key)
+
     if settings.auth_mode == "dev":
-        return await _dev_user(session, x_dealer_id)
-    return await _supabase_user(session, authorization)
+        # dev trusts the header outright (single-tenant demo / local)
+        return await _dev_user(session, str(target) if target else x_dealer_id)
+
+    user = await _supabase_user(session, authorization)
+    if target is None and x_dealer_id:
+        try:
+            target = uuid.UUID(x_dealer_id)
+        except ValueError:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "X-Dealer-Id is not a valid UUID")
+
+    # Store switch: honor an explicit selection ONLY if the user may access it.
+    # A user always has access to their own dealer; ADMINs (e.g. a group owner)
+    # may switch across the group's stores. This is the cross-tenant guard.
+    if target and target != user.dealer_id:
+        if user.role != "ADMIN":
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "You are not authorized to view that store."
+            )
+        return CurrentUser(user_id=user.user_id, dealer_id=target, role=user.role)
+    return user
 
 
 CurrentUserDep = Annotated[CurrentUser, Depends(get_current_user)]
