@@ -27,7 +27,10 @@ class Settings(BaseSettings):
     supabase_service_role_key: str = ""
 
     # --- App -----------------------------------------------------------------
-    cors_origins: str = "https://dispatch-kohl-pi.vercel.app, http://localhost:3000"
+    cors_origins: str = (
+        "https://www.get3ddispatch.com, https://get3ddispatch.com, "
+        "https://dispatch-kohl-pi.vercel.app, http://localhost:3000"
+    )
     api_prefix: str = "/api"
 
     # Demo clock.  When set (ISO 8601), the app scores "now" against this instant

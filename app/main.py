@@ -61,6 +61,9 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
+    # Backstop so a missing/wrong CORS_ORIGINS var can't silently break the app:
+    # always allow the product domain (any subdomain) and Vercel preview URLs.
+    allow_origin_regex=r"https://([a-z0-9-]+\.)*get3ddispatch\.com|https://[a-z0-9-]+\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
