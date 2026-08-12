@@ -13,6 +13,7 @@ from ..mykaarma.connector import (
     sync_repair_orders,
     upcoming_appointments,
 )
+from ..services.appointments_service import build_appointments_board
 
 router = APIRouter(prefix="/mykaarma", tags=["mykaarma"])
 
@@ -35,6 +36,13 @@ async def upcoming(session: SessionDep, current: CurrentUserDep, days: int = 14)
     booking flow straight from the app.
     """
     return await upcoming_appointments(session, current.dealer_id, days)
+
+
+@router.get("/appointments/board")
+async def appointments_board(session: SessionDep, current: CurrentUserDep, days: int = 1):
+    """The Appointments screen: live myKaarma appointments enriched with
+    complexity, a show-likelihood estimate, and a capacity-hold decision."""
+    return await build_appointments_board(session, current.dealer_id, days)
 
 
 @router.post("/sync/opcodes")

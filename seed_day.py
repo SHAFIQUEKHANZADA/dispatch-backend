@@ -119,8 +119,16 @@ async def main() -> None:
         await s.execute(update(ROHistory).where(ROHistory.dealer_id == did).values(imported_at=now))
         await s.commit()
 
-        techs = list((await s.execute(select(Technician).where(
-            Technician.dealer_id == did, Technician.active.is_(True)).order_by(Technician.name))).scalars())
+        # Build the day's board on a clean ~10-tech crew (8 Main + 2 Lube) so the
+        # dashboard + route sheet read like the mockup — not all 47 real techs at
+        # once. The rest stay active for the scoreboard + dispatch ranking.
+        mains = list((await s.execute(select(Technician).where(
+            Technician.dealer_id == did, Technician.active.is_(True),
+            Technician.team == "Main").order_by(Technician.name).limit(8))).scalars())
+        lubes = list((await s.execute(select(Technician).where(
+            Technician.dealer_id == did, Technician.active.is_(True),
+            Technician.team == "Lube").order_by(Technician.name).limit(2))).scalars())
+        techs = mains + lubes
 
         seq = 6000
         made_ro = made_asn = 0
@@ -130,7 +138,7 @@ async def main() -> None:
             seq += 1
             yr, mk, md = RNG.choice(VEHICLES)
             ro = RepairOrder(
-                dealer_id=did, ro_number=f"{prefix}-{seq}", vehicle_year=yr, vehicle_make=mk,
+                dealer_id=did, ro_number=f"{seq}", vehicle_year=yr, vehicle_make=mk,
                 vehicle_model=md, mileage=RNG.randint(20000, 120000), concern_category=cat,
                 work_type=wt, tier=tier, est_hours=hrs, status=status,
                 written_at=when, promise_at=when + timedelta(hours=4))
@@ -183,9 +191,12 @@ async def main() -> None:
                 cat, wt, tier, op, desc = RNG.choice(CATS)
                 ro = new_ro("I", cat, wt, tier, RNG.choice([1.0, 1.5, 2.0]), "IN_PROGRESS", (op, desc), now)
                 await s.flush()
+                # vary how long they've been on it so the route-sheet green bars
+                # fill to different widths (matches the mockup)
+                started_ago = RNG.choice([15, 25, 40, 55, 70, 85])
                 s.add(Assignment(dealer_id=did, ro_id=ro.id, technician_id=t.id, match_score=92,
                     score_reasons=[], score_confident=True, recommended_rank=1, was_ai_recommendation=True,
-                    assigned_at=now - timedelta(minutes=25), started_at=now - timedelta(minutes=25), completed_at=None))
+                    assigned_at=now - timedelta(minutes=started_ago), started_at=now - timedelta(minutes=started_ago), completed_at=None))
                 made_asn += 1
 
             for _ in range(n_queued):

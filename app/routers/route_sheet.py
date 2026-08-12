@@ -112,12 +112,14 @@ async def get_route_sheet(session: SessionDep, current: CurrentUserDep):
     )
     mech: dict = {}
     started: dict = {}
+    started_at: dict = {}
     for a, t in assigns:
         # keep the most recent assignment per RO
         prev = mech.get(a.ro_id)
         if prev is None or (a.assigned_at and prev[1] and a.assigned_at > prev[1]):
             mech[a.ro_id] = (t.name, a.assigned_at)
             started[a.ro_id] = a.started_at is not None
+            started_at[a.ro_id] = a.started_at
 
     rows = []
     for ro in ros:
@@ -154,6 +156,22 @@ async def get_route_sheet(session: SessionDep, current: CurrentUserDep):
             else:
                 checks[label] = None
 
+        # progress % for the row wash: done fills 100, working fills toward the
+        # finish (elapsed vs estimate), queued a small stub, others none.
+        progress = 0
+        if st == "done":
+            progress = 100
+        elif st == "queued":
+            progress = 8
+        elif st == "working":
+            sa = started_at.get(ro.id)
+            est_min = float(ro.est_hours or 1) * 60
+            if sa and est_min > 0:
+                elapsed = (now - sa).total_seconds() / 60
+                progress = max(10, min(95, int(elapsed / est_min * 100)))
+            else:
+                progress = 50
+
         rows.append({
             "ro_number": ro.ro_number,
             "owner": _owner(ro.ro_number),
@@ -165,6 +183,7 @@ async def get_route_sheet(session: SessionDep, current: CurrentUserDep):
             "hours": float(ro.est_hours or 0),
             "promised": promised,
             "carried_over": carried,
+            "progress": progress,
             "checks": checks,
         })
 
