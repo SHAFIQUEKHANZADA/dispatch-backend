@@ -106,7 +106,10 @@ def _short_name(name: str) -> str:
 
 
 async def build_appointments_board(session: AsyncSession, dealer_id: uuid.UUID, days: int = 1) -> dict:
-    raw = await upcoming_appointments(session, dealer_id, days)
+    # enrich=False: the board list only needs time/customer/vehicle/concern (all
+    # on the appointment itself). The heavy per-customer phone/email lookups are
+    # skipped here — on a busy store they are 1,000+ calls and the page hangs.
+    raw = await upcoming_appointments(session, dealer_id, days, enrich=False)
     if not raw.get("available"):
         return {"available": False, "reason": raw.get("reason"), "appointments": [], "stats": {}}
 

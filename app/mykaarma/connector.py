@@ -466,7 +466,7 @@ def _map_appointment(a: dict) -> dict:
 
 
 async def upcoming_appointments(
-    session: AsyncSession, dealer_id: uuid.UUID, days: int = 14
+    session: AsyncSession, dealer_id: uuid.UUID, days: int = 14, enrich: bool = True
 ) -> dict:
     """Booked appointments from today through +`days` (the voice-agent bookings).
 
@@ -531,7 +531,10 @@ async def upcoming_appointments(
         except MyKaarmaError:
             return cu, None
 
-    if by_uuid:
+    # Per-customer enrichment is O(appointments) myKaarma calls — fine for a
+    # handful, fatal for a busy store (1,000+ bookings => the request hangs). The
+    # board passes enrich=False; the list already has customer/vehicle/concern.
+    if enrich and by_uuid:
         pairs = await asyncio.gather(*[asyncio.to_thread(lookup, cu, nm) for cu, nm in by_uuid.items()])
         records = {cu: cust for cu, cust in pairs if cust}
         for a in appts:

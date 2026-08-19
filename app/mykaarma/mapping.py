@@ -181,6 +181,11 @@ def line_waiting_on_parts(job: dict) -> bool:
 def map_order(payload: dict) -> MappedRO:
     """Map one Order v2 `global_order` response into our RO shape."""
     order = payload.get("order") or payload.get("globalOrder") or payload
+    # The Order v2 read nests the body one level deeper: {uuid, order:{header,...}}.
+    # Unwrap to the real order, keeping the outer order UUID for write-back.
+    _outer_uuid = order.get("uuid") if isinstance(order, dict) else None
+    if isinstance(order, dict) and isinstance(order.get("order"), dict) and "header" in order["order"]:
+        order = order["order"]
     header = order.get("header") or {}
     customer = order.get("customer") or {}
     vehicle = order.get("vehicle") or {}
@@ -193,9 +198,10 @@ def map_order(payload: dict) -> MappedRO:
     for job in jobs:
         blocked = line_waiting_on_parts(job)
         any_parts_block = any_parts_block or blocked
-        tech_no = job.get("techNo") or job.get("technicianNumber")
-        if tech_no:
-            tech_nos.append(str(tech_no).strip())
+        # myKaarma's field is `techNos` (plural), sometimes comma/slash separated.
+        raw_tech = job.get("techNos") or job.get("techNo") or job.get("technicianNumber") or ""
+        line_techs = [tn.strip() for tn in str(raw_tech).replace("/", ",").split(",") if tn.strip()]
+        tech_nos.extend(line_techs)
         lines.append(
             MappedLine(
                 op_code=(str(job.get("laborOpCode")).strip() if job.get("laborOpCode") else None),
@@ -207,7 +213,7 @@ def map_order(payload: dict) -> MappedRO:
                 ),
                 flagged_hours=_num(job.get("soldHours")),
                 labor_type=map_labor_type(job.get("laborType")),
-                tech_no=(str(tech_no).strip() if tech_no else None),
+                tech_no=(line_techs[0] if line_techs else None),
                 dispatch_line_status=job.get("dispatchLineStatus"),
                 waiting_on_parts=blocked,
             )
@@ -218,6 +224,12 @@ def map_order(payload: dict) -> MappedRO:
     # whose parts have not arrived, whatever the DMS header says.
     if any_parts_block and status in ("READY_TO_DISPATCH", "OPEN"):
         status = "WAITING_ON_PARTS"
+    # myKaarma marks every active RO simply "open" (status O), with no separate
+    # "ready to dispatch" flag. Derive the dispatch lifecycle from the signals we
+    # DO have: a tech already on a line -> in progress; otherwise, parts are in and
+    # no one is on it yet -> ready for a tech to be assigned.
+    if status == "OPEN":
+        status = "IN_PROGRESS" if tech_nos else "READY_TO_DISPATCH"
 
     flags: list[str] = []
     if header.get("waiter"):
@@ -231,7 +243,7 @@ def map_order(payload: dict) -> MappedRO:
         ro_number=str(
             header.get("roNumber") or header.get("orderNumber") or header.get("number") or ""
         ).strip(),
-        order_uuid=order.get("uuid") or header.get("orderUuid"),
+        order_uuid=_outer_uuid or order.get("uuid") or header.get("orderUuid"),
         status=status,
         vin=(str(vehicle.get("vin")).strip().upper() if vehicle.get("vin") else None),
         vehicle_year=_int(vehicle.get("year") or vehicle.get("vehicleYear")),
