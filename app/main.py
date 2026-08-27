@@ -23,6 +23,7 @@ from .routers import (
     stores,
     technicians,
     timeline,
+    warranty,
 )
 
 settings = get_settings()
@@ -83,6 +84,7 @@ for r in (
     timeline.router,
     route_sheet.router,
     stores.router,
+    warranty.router,
     dev.router,
 ):
     app.include_router(r, prefix=settings.api_prefix)

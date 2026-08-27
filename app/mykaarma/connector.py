@@ -41,6 +41,11 @@ from .mapping import map_order
 
 settings = get_settings()
 
+# How far back an OPEN RO can be and still count as "active work" for the dispatch
+# board. myKaarma's open list is a multi-year backlog of never-closed ROs; this
+# keeps the board to genuinely current work.
+RECENT_RO_DAYS = 14
+
 
 @dataclass
 class SyncResult:
@@ -253,17 +258,27 @@ async def sync_opcodes(session: AsyncSession, dealer_id: uuid.UUID) -> SyncResul
     return SyncResult(True, f"Synced {len(ops)} opcode(s): {added} new, {updated} updated{note}", detail)
 
 
-def list_open_ro_uuids(client: MyKaarmaClient, max_pages: int = 20) -> tuple[list[str], int]:
+def list_open_ro_uuids(
+    client: MyKaarmaClient, max_pages: int = 20, from_order_date: Optional[str] = None
+) -> tuple[list[str], int]:
     """Enumerate OPEN repair orders via the documented specificSearch endpoint.
 
     Returns (order_uuids, total_count). Pages through the results (size 150) so a
     busy shop's whole open board is captured, not just the first page.
+
+    `from_order_date` (yyyy-MM-dd) limits to recent orders — myKaarma's "open" list
+    is a backlog going back years (advisors don't close ROs), so a dispatch board
+    must filter to genuinely active work, not the graveyard.
     """
     uuids: list[str] = []
     total = 0
     page = 0
     while page < max_pages:
-        data = client.search_orders(order_status="O", order_type="RO", page_no=page, size=150)
+        data = client.search_orders(
+            order_status="O", order_type="RO", page_no=page, size=150,
+            from_order_date=from_order_date,
+            date_filter_type="ORDER_DATE" if from_order_date else None,
+        )
         total = data.get("totalCount") or 0
         orders = data.get("orders") or []
         if not orders:
@@ -331,7 +346,11 @@ async def sync_repair_orders(
                 {"ro_scope_granted": True, "search_scope": False, "ingested": 0},
             )
         try:
-            order_uuids, total_open = list_open_ro_uuids(client)
+            # Only recent open ROs — the dispatch board is for active work, not the
+            # years-deep backlog of ROs that were finished but never closed out.
+            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+            recent_from = (_dt.now(_tz.utc) - _td(days=RECENT_RO_DAYS)).date().isoformat()
+            order_uuids, total_open = list_open_ro_uuids(client, from_order_date=recent_from)
         except MyKaarmaError as e:
             await _record(session, dealer_id, status="RO_ENUM_FAILED",
                           detail={"error": str(e)[:200]}, ro_scope=True)
@@ -353,6 +372,10 @@ async def sync_repair_orders(
         )
 
     ingested, failed, drift = 0, [], []
+    # Commit in small batches so a flaky network can't wipe the whole run — each
+    # saved batch persists, and re-running upserts by RO number (resumable).
+    BATCH = 10
+    pending = 0
     for ou in order_uuids:
         try:
             payload = client.get_order(ou)
@@ -362,10 +385,29 @@ async def sync_repair_orders(
         try:
             result = await ingest_order(session, dealer_id, payload)
             ingested += 1
+            pending += 1
             if result.get("dms_mismatch"):
                 drift.append(result["dms_mismatch"])
         except Exception as e:  # noqa: BLE001 — never let one bad order kill the sync
             failed.append({"order_uuid": ou, "error": f"mapping/ingest failed: {e}"[:200]})
+            continue
+        if pending >= BATCH:
+            try:
+                await session.commit()
+                pending = 0
+            except Exception as e:  # DB blip — roll back this batch, keep going
+                await session.rollback()
+                ingested -= pending
+                pending = 0
+                failed.append({"order_uuid": "batch", "error": f"db commit failed: {str(e)[:120]}"})
+
+    if pending:
+        try:
+            await session.commit()
+        except Exception as e:  # noqa: BLE001
+            await session.rollback()
+            ingested -= pending
+            failed.append({"order_uuid": "batch", "error": f"db commit failed: {str(e)[:120]}"})
 
     detail = {
         "ro_scope_granted": True,

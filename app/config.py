@@ -51,6 +51,37 @@ class Settings(BaseSettings):
     # env fallback is applied ONLY to that store and never leaks to other tenants.
     mykaarma_default_store_key: str = "mcgrath_honda_stcharles"
 
+    # --- Warranty RO Audit (Claude reads the RO; the RESULT is deterministic) --
+    # The Anthropic key powers the RO *reading*. Without it the module still
+    # loads, but an audit returns a clear "key not configured" error rather than
+    # a fabricated result (Guardian rule).
+    anthropic_api_key: str = ""
+    warranty_audit_model: str = "claude-sonnet-5"
+    # Safety cap on the batch audit so one click can't fan out over hundreds of
+    # ROs (and Claude calls). The endpoint logs when it truncates — never silent.
+    warranty_batch_cap: int = 25
+
+    # --- GoHighLevel sync (OPTIONAL) ----------------------------------------
+    # If these are set, each audit result is mirrored to the GHL "Warranty RO
+    # Audit" custom object so Don's existing GHL workflow stays in sync. Left
+    # empty = sync disabled; the audit still works fully without it.
+    ghl_api_key: str = ""
+    ghl_location_id: str = ""
+    ghl_object_key: str = "custom_objects.warranty_ro_audits"
+    ghl_object_id: str = ""
+    ghl_base: str = "https://services.leadconnectorhq.com"
+    # Shared secret GHL sends with its upload webhook (in ?token= or an
+    # X-Webhook-Secret header) so the public endpoint can't be hit by anyone.
+    ghl_webhook_secret: str = ""
+
+    @property
+    def anthropic_configured(self) -> bool:
+        return bool(self.anthropic_api_key)
+
+    @property
+    def ghl_configured(self) -> bool:
+        return bool(self.ghl_api_key and self.ghl_location_id)
+
     @property
     def mykaarma_env_configured(self) -> bool:
         return bool(

@@ -54,7 +54,7 @@ class MyKaarmaCreds:
 
 
 class MyKaarmaClient:
-    def __init__(self, creds: MyKaarmaCreds, timeout: float = 30.0):
+    def __init__(self, creds: MyKaarmaCreds, timeout: float = 60.0):
         self.creds = creds
         self._timeout = timeout
 
@@ -95,15 +95,39 @@ class MyKaarmaClient:
             raise MyKaarmaError(f"{label}: HTTP {resp.status_code} — {resp.text[:200]}")
         return resp.json()
 
+    # Transient network faults (flaky Wi-Fi, DNS drops, congestion) should not fail
+    # a whole 100+-call sync. Retry each call a few times with backoff, then raise a
+    # MyKaarmaError the caller can catch per-order.
+    _RETRYABLE = (
+        httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
+        httpx.WriteTimeout, httpx.PoolTimeout, httpx.RemoteProtocolError,
+    )
+
+    def _request(
+        self, method: str, path: str, label: str,
+        body: Optional[dict] = None, params: Optional[dict] = None, attempts: int = 4,
+    ) -> Any:
+        import time
+        last: Optional[Exception] = None
+        for i in range(attempts):
+            try:
+                with httpx.Client(timeout=self._timeout) as c:
+                    if method == "POST":
+                        resp = c.post(f"{BASE_URL}{path}", headers=self._headers, json=body, params=params)
+                    else:
+                        resp = c.get(f"{BASE_URL}{path}", headers=self._headers, params=params)
+                return self._handle(resp, label)
+            except self._RETRYABLE as e:
+                last = e
+                if i < attempts - 1:
+                    time.sleep(1.5 * (i + 1))  # 1.5s, 3s, 4.5s backoff
+        raise MyKaarmaError(f"{label}: network error after {attempts} attempts — {last}")
+
     def _post(self, path: str, body: dict, label: str, params: Optional[dict] = None) -> Any:
-        with httpx.Client(timeout=self._timeout) as c:
-            resp = c.post(f"{BASE_URL}{path}", headers=self._headers, json=body, params=params)
-        return self._handle(resp, label)
+        return self._request("POST", path, label, body=body, params=params)
 
     def _get(self, path: str, label: str, params: Optional[dict] = None) -> Any:
-        with httpx.Client(timeout=self._timeout) as c:
-            resp = c.get(f"{BASE_URL}{path}", headers=self._headers, params=params)
-        return self._handle(resp, label)
+        return self._request("GET", path, label, params=params)
 
     # --------------------------------------------------------------------- #
     # health                                                                #
@@ -116,6 +140,12 @@ class MyKaarmaClient:
         """
         d = self.search_opcodes(result_size=1)
         return {"ok": True, "opcode_total": d.get("totalCount")}
+
+    def get_configurations(self) -> dict:
+        """Every dealer + department these credentials can access — myKaarma's
+        "checking access" endpoint. Returns enabledBusinesses[] with uuid, name,
+        and departments[] so we map each store to its own Service department UUID."""
+        return self._get("/developer/application/configurations", "get_configurations")
 
     # --------------------------------------------------------------------- #
     # WORKING endpoints (verified live in the sandbox)                       #

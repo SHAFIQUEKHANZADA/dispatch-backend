@@ -27,7 +27,7 @@ from ..services.dispatch_service import (
     techs_for_ro,
 )
 from ..engine.match_score import check_hard_constraints, score_technician
-from ..models import RepairOrder
+from ..models import Assignment, RepairOrder
 
 router = APIRouter(prefix="/technicians", tags=["technicians"])
 
@@ -476,6 +476,83 @@ async def act_on_bio(
     )
     await session.commit()
     return {"id": str(t.id), "bio_status": t.bio_status, "action": action}
+
+
+# --------------------------------------------------------------------------- #
+# Tech-facing "My Work" view — the notification path we own end-to-end.        #
+# A tech opens this on their phone/tablet; when the dispatcher assigns them,    #
+# the job appears here (live), so an assignment reaches the tech without any    #
+# DMS write-back. Declared before /{tech_id} to keep routing unambiguous.      #
+# --------------------------------------------------------------------------- #
+
+@router.get("/{tech_id}/my-work")
+async def my_work(tech_id: uuid.UUID, session: SessionDep, current: CurrentUserDep):
+    """A technician's own live worklist — jobs dispatched to them, not yet done."""
+    t = await session.get(Technician, tech_id)
+    if t is None or t.dealer_id != current.dealer_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Technician not found")
+
+    rows = list(
+        (
+            await session.execute(
+                select(Assignment, RepairOrder)
+                .join(RepairOrder, RepairOrder.id == Assignment.ro_id)
+                .where(
+                    Assignment.technician_id == tech_id,
+                    Assignment.completed_at.is_(None),
+                )
+                .order_by(Assignment.assigned_at.desc())
+            )
+        ).all()
+    )
+
+    jobs = []
+    for a, ro in rows:
+        jobs.append({
+            "assignment_id": str(a.id),
+            "ro_id": str(ro.id),
+            "ro_number": ro.ro_number,
+            "vehicle": " ".join(str(x) for x in (ro.vehicle_year, ro.vehicle_make, ro.vehicle_model) if x),
+            "concern": ro.concern_category or "Service",
+            "concern_short": (ro.lines[0].description if ro.lines else ro.concern_category) or "Service",
+            "est_hours": float(ro.est_hours or 0),
+            "promise_at": ro.promise_at.isoformat() if ro.promise_at else None,
+            "assigned_at": a.assigned_at.isoformat() if a.assigned_at else None,
+            "state": "working" if a.started_at else "assigned",
+        })
+    return {
+        "technician_id": str(t.id),
+        "technician_name": t.name,
+        "count": len(jobs),
+        "jobs": jobs,
+    }
+
+
+@router.post("/assignment/{assignment_id}/{action}")
+async def update_assignment(
+    assignment_id: uuid.UUID, action: str, session: SessionDep, current: CurrentUserDep
+):
+    """Tech advances their own job from the My Work view: start | done."""
+    if action not in {"start", "done"}:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "unknown action")
+    a = await session.get(Assignment, assignment_id)
+    if a is None or a.dealer_id != current.dealer_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Assignment not found")
+
+    from ..clock import default_now
+    now = default_now()
+    ro = await session.get(RepairOrder, a.ro_id)
+    if action == "start":
+        a.started_at = a.started_at or now
+        if ro:
+            ro.status = "IN_PROGRESS"
+    else:  # done
+        a.completed_at = now
+        a.started_at = a.started_at or now
+        if ro:
+            ro.status = "COMPLETED"
+    await session.commit()
+    return {"assignment_id": str(a.id), "action": action, "ok": True}
 
 
 @router.get("/{tech_id}")

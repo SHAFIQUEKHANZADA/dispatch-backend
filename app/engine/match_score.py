@@ -194,7 +194,11 @@ def check_hard_constraints(
     start_at = max(free_at, ctx.now)
     finish = project_finish(start_at, ro.est_hours, tech.lunch_start_at, tech.lunch_end_at)
 
-    if ro.promise_at and finish > ro.promise_at:
+    # A promise still in the FUTURE is a real deadline — exclude a tech who can't
+    # make it. But a promise already in the PAST means the RO is OVERDUE, not
+    # undispatchable: every tech "misses" it, so excluding them all would just hide
+    # urgent work. Let overdue ROs through — scoring still ranks by soonest finish.
+    if ro.promise_at and ro.promise_at > ctx.now and finish > ro.promise_at:
         over = (finish - ro.promise_at).total_seconds() / 3600.0
         return NotEligible(
             tech.id,

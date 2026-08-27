@@ -566,6 +566,88 @@ class AdvisorScore(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
+# ======================= WARRANTY RO AUDIT ================================= #
+
+# The 12-check warranty documentation rubric (Honda-based, configurable).
+# `key`  -> stable id + GHL single-option field key.
+# `name` -> exact check name Claude must echo back.
+# `needs`-> what the check requires (drives the Guardian "needs_review" default).
+# Stored per-dealer in warranty_rubrics; this is the seed the app falls back to.
+DEFAULT_WARRANTY_RUBRIC = [
+    {"key": "complaintcausecorrection", "name": "Complaint-Cause-Correction",
+     "needs": "All three C's — Complaint, Cause, and Correction — present and complete.",
+     "dom_section": "Job / concern lines"},
+    {"key": "rovin_documentation", "name": "RO/VIN Documentation",
+     "needs": "RO number and full 17-char VIN present, legible, and matching the vehicle.",
+     "dom_section": "RO header"},
+    {"key": "mileage__authorization", "name": "Mileage & Authorization",
+     "needs": "Mileage recorded and customer authorization present.",
+     "dom_section": "RO header / signature"},
+    {"key": "technician_id_match", "name": "Technician ID Match",
+     "needs": "The tech who did the work is identified and matches the claim.",
+     "dom_section": "Job line tech"},
+    {"key": "labor_ops__hours", "name": "Labor Ops & Hours",
+     "needs": "Labor op codes and claimed hours documented and valid.",
+     "dom_section": "Job / labor lines"},
+    {"key": "punch_records_vs_claimed_time", "name": "Punch Records vs Claimed Time",
+     "needs": "Actual punch/clock time supports the claimed labor time.",
+     "dom_section": "Time punch records"},
+    {"key": "parts_documentation", "name": "Parts Documentation",
+     "needs": "Parts listed with part numbers/quantities; defective parts noted if required.",
+     "dom_section": "Parts lines"},
+    {"key": "dtc__ihds_documentation", "name": "DTC / i-HDS Documentation",
+     "needs": "Diagnostic codes / i-HDS session documented where applicable.",
+     "dom_section": "Diagnostic notes"},
+    {"key": "tech_line_paperwork", "name": "Tech Line Paperwork",
+     "needs": "Tech Line case number/authorization present if Tech Line was used.",
+     "dom_section": "Tech Line reference"},
+    {"key": "battery_tester_documentation", "name": "Battery Tester Documentation",
+     "needs": "Battery/charging test printout for battery claims.",
+     "dom_section": "Battery test printout"},
+    {"key": "sublet_documentation", "name": "Sublet Documentation",
+     "needs": "Sublet invoices attached and documented for sublet work.",
+     "dom_section": "Sublet lines"},
+    {"key": "straighttimedpsm_authorization", "name": "Straight-Time/DPSM Authorization",
+     "needs": "DPSM or straight-time authorization present where required.",
+     "dom_section": "DPSM authorization"},
+]
+
+WARRANTY_RESULTS = ("pass", "needs_review", "fail", "na")
+WARRANTY_STATUSES = ("pending", "pass", "needs_review", "fail")
+
+
+class WarrantyROAudit(Base):
+    __tablename__ = "warranty_ro_audits"
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("dealers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    ro_number: Mapped[str] = mapped_column(Text, nullable=False)
+    vin: Mapped[Optional[str]] = mapped_column(Text)
+    technician_id: Mapped[Optional[str]] = mapped_column(Text)
+    job_line_type: Mapped[Optional[str]] = mapped_column(Text)
+    source_ro_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        Uuid, ForeignKey("repair_orders.id", ondelete="SET NULL")
+    )
+    audit_status: Mapped[str] = mapped_column(Text, default="pending", index=True)
+    findings: Mapped[list] = mapped_column(JSONBType(), default=list)
+    reviewer_decision: Mapped[str] = mapped_column(Text, default="not_reviewed")
+    reviewer_notes: Mapped[Optional[str]] = mapped_column(Text)
+    submitted: Mapped[bool] = mapped_column(Boolean, default=False)
+    date_submitted: Mapped[Optional[datetime]] = mapped_column(UTCDateTime)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
+
+
+class WarrantyRubric(Base):
+    __tablename__ = "warranty_rubrics"
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("dealers.id", ondelete="CASCADE"), primary_key=True
+    )
+    checks: Mapped[list] = mapped_column(JSONBType(), default=lambda: copy.deepcopy(DEFAULT_WARRANTY_RUBRIC))
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_log"
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)

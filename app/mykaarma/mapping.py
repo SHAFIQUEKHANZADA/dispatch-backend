@@ -163,6 +163,23 @@ def map_labor_type(raw: Any) -> Optional[str]:
     return None
 
 
+# Op-codes / descriptions that are consent, notification, or signature boilerplate
+# rather than actual work — hidden from the RO card.
+_BOILERPLATE_OPCODES = {"TCPA", "2WAYSPAY", "CONSENT", "ESIGN", "DISCLAIMER"}
+_BOILERPLATE_PHRASES = (
+    "i consent", "consent to being contacted", "2 ways to pay", "client signature",
+    "signature x", "processing fee", "not a required condition",
+)
+
+
+def _is_boilerplate_line(op_code: Any, desc: Any) -> bool:
+    oc = str(op_code or "").strip().upper()
+    if oc in _BOILERPLATE_OPCODES:
+        return True
+    d = str(desc or "").lower()
+    return any(p in d for p in _BOILERPLATE_PHRASES)
+
+
 def line_waiting_on_parts(job: dict) -> bool:
     """A line is parts-blocked when any part has been ordered but not sold/filled."""
     for p in job.get("parts", []) or []:
@@ -196,6 +213,10 @@ def map_order(payload: dict) -> MappedRO:
     any_parts_block = False
 
     for job in jobs:
+        # Skip consent/notification boilerplate lines (TCPA, payment notices,
+        # signature blocks) — they're legal text, not work, and clutter the RO card.
+        if _is_boilerplate_line(job.get("laborOpCode"), job.get("laborOpCodeDesc") or job.get("description")):
+            continue
         blocked = line_waiting_on_parts(job)
         any_parts_block = any_parts_block or blocked
         # myKaarma's field is `techNos` (plural), sometimes comma/slash separated.
@@ -251,7 +272,10 @@ def map_order(payload: dict) -> MappedRO:
         vehicle_model=vehicle.get("model") or vehicle.get("vehicleModel"),
         mileage=_int(header.get("mileageIn") or header.get("mileageOut")),
         est_hours=est,
-        written_at=_combine_date_time(header.get("createDate"), header.get("createTime")),
+        written_at=_combine_date_time(
+            header.get("orderDate") or header.get("createDate"),
+            header.get("orderTime") or header.get("createTime"),
+        ),
         promise_at=_combine_date_time(header.get("promisedDate"), header.get("promisedTime")),
         flags=flags,
         advisor_id=(
