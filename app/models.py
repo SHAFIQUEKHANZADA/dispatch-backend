@@ -177,6 +177,12 @@ class Technician(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     employee_id: Mapped[Optional[str]] = mapped_column(Text)
     dms_tech_no: Mapped[Optional[str]] = mapped_column(Text)
+    # Contact for instant assignment notification (SMS via GHL, email fallback).
+    phone: Mapped[Optional[str]] = mapped_column(Text)
+    email: Mapped[Optional[str]] = mapped_column(Text)
+    # GHL contact id, cached after the first upsert so the tech's assignment
+    # texts thread into one conversation in GHL instead of creating duplicates.
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(Text)
     team: Mapped[Optional[str]] = mapped_column(Text)
     skill_level: Mapped[Optional[str]] = mapped_column(Text)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -482,6 +488,14 @@ class Assignment(Base):
     assigned_by: Mapped[Optional[uuid.UUID]] = mapped_column(Uuid)
     started_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime)
     completed_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime)
+
+    # Instant tech notification (SMS via GHL, email fallback). Tracked so a
+    # failed text surfaces on the board instead of a job sitting unacknowledged.
+    notify_channel: Mapped[Optional[str]] = mapped_column(Text)   # SMS | EMAIL
+    notify_status: Mapped[Optional[str]] = mapped_column(Text)    # queued | sent | delivered | failed
+    notified_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime)
+    notify_error: Mapped[Optional[str]] = mapped_column(Text)
+    notify_ref: Mapped[Optional[str]] = mapped_column(Text)       # GHL message / conversation id
 
 
 # ======================== COMPUTED METRICS ================================= #

@@ -15,6 +15,7 @@ from .. import audit
 from ..deps import CurrentUserDep, SessionDep
 from ..models import Assignment, RepairOrder, Technician
 from ..services.dispatch_service import load_shop, plan_smart_decision, rank_for_ro
+from ..services.notifications_service import notify_tech_assignment
 
 router = APIRouter(prefix="/dispatch", tags=["dispatch"])
 
@@ -280,6 +281,9 @@ async def assign(body: AssignRequest, session: SessionDep, current: CurrentUserD
 
     await session.commit()
 
+    # Tell the tech immediately (SMS via GHL, tracked on the assignment).
+    await notify_tech_assignment(session, assignment)
+
     return {
         "assignment_id": str(assignment.id),
         "ro_number": ro.ro_number,
@@ -288,6 +292,9 @@ async def assign(body: AssignRequest, session: SessionDep, current: CurrentUserD
         "rank": rank,
         "was_ai_recommendation": took_recommendation,
         "status": ro.status,
+        # So the board can confirm the tech was texted the instant you dispatch.
+        "notify_status": assignment.notify_status,
+        "notify_channel": assignment.notify_channel,
     }
 
 
@@ -332,6 +339,7 @@ async def smart_decision_apply(
     """
     shop = await load_shop(session, current.dealer_id)
     applied, skipped = [], []
+    placed_assignments: list[Assignment] = []
 
     for item in body.assignments:
         ro = await session.get(RepairOrder, item.ro_id)
@@ -376,23 +384,23 @@ async def smart_decision_apply(
             if c.technician_id == str(item.technician_id)
         )
 
-        session.add(
-            Assignment(
-                dealer_id=current.dealer_id,
-                ro_id=ro.id,
-                technician_id=tech.id,
-                match_score=chosen.score,
-                score_reasons=[r.to_dict() for r in chosen.reasons],
-                score_warnings=list(chosen.warnings),
-                score_confident=chosen.confident,
-                recommended_rank=rank,
-                was_ai_recommendation=True,
-                engine_version=ranking.engine_version,
-                weights_used=ranking.to_dict()["weights"],
-                assigned_by=current.user_id,
-                started_at=shop.now,
-            )
+        new_assignment = Assignment(
+            dealer_id=current.dealer_id,
+            ro_id=ro.id,
+            technician_id=tech.id,
+            match_score=chosen.score,
+            score_reasons=[r.to_dict() for r in chosen.reasons],
+            score_warnings=list(chosen.warnings),
+            score_confident=chosen.confident,
+            recommended_rank=rank,
+            was_ai_recommendation=True,
+            engine_version=ranking.engine_version,
+            weights_used=ranking.to_dict()["weights"],
+            assigned_by=current.user_id,
+            started_at=shop.now,
         )
+        session.add(new_assignment)
+        placed_assignments.append(new_assignment)
         ro.status = "IN_PROGRESS"
         applied.append(
             {
@@ -421,5 +429,9 @@ async def smart_decision_apply(
         payload={"applied": applied, "skipped": skipped},
     )
     await session.commit()
+
+    # Notify each newly-assigned tech (SMS via GHL, tracked per assignment).
+    for a in placed_assignments:
+        await notify_tech_assignment(session, a)
 
     return {"applied": applied, "skipped": skipped}

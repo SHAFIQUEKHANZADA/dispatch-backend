@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     # Shared secret GHL sends with its upload webhook (in ?token= or an
     # X-Webhook-Secret header) so the public endpoint can't be hit by anyone.
     ghl_webhook_secret: str = ""
+    # Inbound-webhook trigger URL of the GHL workflow that texts/emails the tech
+    # when a job is assigned. Our backend POSTs the tech + RO here; GHL's carrier
+    # connect sends the SMS. Empty = notifications are tracked but not yet sent.
+    ghl_tech_notify_webhook: str = ""
 
     @property
     def anthropic_configured(self) -> bool:

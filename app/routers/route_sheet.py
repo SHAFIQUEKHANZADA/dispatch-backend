@@ -113,6 +113,7 @@ async def get_route_sheet(session: SessionDep, current: CurrentUserDep):
     mech: dict = {}
     started: dict = {}
     started_at: dict = {}
+    notified: dict = {}
     for a, t in assigns:
         # keep the most recent assignment per RO
         prev = mech.get(a.ro_id)
@@ -120,6 +121,7 @@ async def get_route_sheet(session: SessionDep, current: CurrentUserDep):
             mech[a.ro_id] = (t.name, a.assigned_at)
             started[a.ro_id] = a.started_at is not None
             started_at[a.ro_id] = a.started_at
+            notified[a.ro_id] = a.notify_status
 
     rows = []
     for ro in ros:
@@ -185,6 +187,8 @@ async def get_route_sheet(session: SessionDep, current: CurrentUserDep):
             "carried_over": carried,
             "progress": progress,
             "checks": checks,
+            # notification of the assigned tech: sent | delivered | failed | queued | None
+            "notified": notified.get(ro.id),
         })
 
     carried = sorted([r for r in rows if r["carried_over"]], key=lambda r: r["ro_number"])
