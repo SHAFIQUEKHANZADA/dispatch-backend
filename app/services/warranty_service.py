@@ -172,18 +172,52 @@ def _system_prompt(rubric: list[dict]) -> str:
 # --------------------------------------------------------------------------- #
 
 
-async def _call_claude(system: str, user_content: Any) -> str:
-    """user_content is either a plain string or a list of Anthropic content
-    blocks (text / document / image), so the same call serves the structured-RO
-    path and the uploaded-scan path."""
+# Forcing a tool call makes Anthropic return guaranteed-valid structured JSON
+# (as the tool's `input`), so a stray quote in a reason can never break parsing.
+_AUDIT_TOOL = {
+    "name": "submit_warranty_audit",
+    "description": "Return the warranty documentation audit for the repair order.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "job_line_type": {
+                "type": "string",
+                "enum": ["Warranty", "Customer Pay", "Internal", "Service Contract", "Unknown"],
+            },
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "check": {"type": "string"},
+                        "result": {"type": "string", "enum": list(WARRANTY_RESULTS)},
+                        "dom_section": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["check", "result", "reason"],
+                },
+            },
+        },
+        "required": ["job_line_type", "findings"],
+    },
+}
+
+
+async def _call_claude(system: str, user_content: Any) -> dict:
+    """Returns the auditor's structured output as a dict. user_content is a
+    plain string or a list of content blocks (text / document / image), so the
+    same call serves the structured-RO path and the uploaded-scan path. We force
+    a tool call so the result is always valid JSON."""
     if not settings.anthropic_configured:
         raise WarrantyAuditError(
             "ANTHROPIC_API_KEY is not configured — add it to backend/.env to run audits."
         )
     body = {
         "model": settings.warranty_audit_model,
-        "max_tokens": 2000,
+        "max_tokens": 3000,
         "system": system,
+        "tools": [_AUDIT_TOOL],
+        "tool_choice": {"type": "tool", "name": "submit_warranty_audit"},
         "messages": [{"role": "user", "content": user_content}],
     }
     headers = {
@@ -198,8 +232,12 @@ async def _call_claude(system: str, user_content: Any) -> str:
                 resp = await client.post(ANTHROPIC_URL, json=body, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
+                for b in data.get("content", []):
+                    if b.get("type") == "tool_use":
+                        return b.get("input") or {}
+                # Fallback: model answered in text instead of the tool.
                 parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
-                return "".join(parts).strip()
+                return _parse_json("".join(parts))
             # 429 / 5xx are worth retrying; 4xx (bad key, bad request) are not.
             if resp.status_code in (429, 500, 502, 503, 529) and backoff:
                 await asyncio.sleep(backoff)
@@ -338,12 +376,7 @@ async def audit_ro(
             ),
         }
     ]
-    raw = await _call_claude(_system_prompt(rubric), user_content)
-    try:
-        model_out = _parse_json(raw)
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise WarrantyAuditError(f"Auditor returned unparseable output: {exc}") from exc
-
+    model_out = await _call_claude(_system_prompt(rubric), user_content)
     findings, audit_status, job_type = _reconcile(rubric, model_out)
     row = await _upsert_audit(
         session, dealer_id, ro.ro_number,
@@ -387,12 +420,7 @@ async def audit_file(session: AsyncSession, dealer_id: uuid.UUID, meta: dict) ->
             + (f"\n\nKnown fields from the system: {json.dumps(hint)}" if hint else "")
         ),
     }
-    raw = await _call_claude(_system_prompt(rubric), [doc, text])
-    try:
-        model_out = _parse_json(raw)
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise WarrantyAuditError(f"Auditor returned unparseable output: {exc}") from exc
-
+    model_out = await _call_claude(_system_prompt(rubric), [doc, text])
     findings, audit_status, job_type = _reconcile(rubric, model_out)
     ro_number = str(meta.get("ro_number") or "").strip() or f"upload-{uuid.uuid4().hex[:8]}"
     return await _upsert_audit(

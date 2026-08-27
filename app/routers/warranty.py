@@ -81,18 +81,9 @@ async def get_audit(audit_id: uuid.UUID, session: SessionDep, current: CurrentUs
     return _dict(a)
 
 
-@router.post("/audit/{ro_id}")
-async def audit_one(ro_id: uuid.UUID, session: SessionDep, current: CurrentUserDep):
-    ro = await session.get(RepairOrder, ro_id)
-    if ro is None or ro.dealer_id != current.dealer_id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Repair order not found")
-    try:
-        row = await audit_ro(session, current.dealer_id, ro)
-    except WarrantyAuditError as exc:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
-    return _dict(row)
-
-
+# NOTE: `/audit/batch` MUST be declared before `/audit/{ro_id}`. Starlette matches
+# routes in order, so a dynamic `/audit/{ro_id}` declared first would swallow the
+# literal "batch" and try to parse it as a UUID.
 @router.post("/audit/batch")
 async def audit_batch(session: SessionDep, current: CurrentUserDep, limit: Optional[int] = None):
     """Audit the store's open ROs (capped). Warranty vs customer-pay is classified
@@ -130,6 +121,18 @@ async def audit_batch(session: SessionDep, current: CurrentUserDep, limit: Optio
     if truncated:
         msg += f". Capped at {cap} — {truncated} more not audited this run."
     return {"audited": audited, "failed": failed, "total_open": total, "capped_at": cap, "message": msg}
+
+
+@router.post("/audit/{ro_id}")
+async def audit_one(ro_id: uuid.UUID, session: SessionDep, current: CurrentUserDep):
+    ro = await session.get(RepairOrder, ro_id)
+    if ro is None or ro.dealer_id != current.dealer_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Repair order not found")
+    try:
+        row = await audit_ro(session, current.dealer_id, ro)
+    except WarrantyAuditError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    return _dict(row)
 
 
 class ReviewIn(BaseModel):
