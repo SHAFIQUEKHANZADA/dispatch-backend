@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import get_settings
 from ..db import utcnow
 from ..models import Assignment, RepairOrder, Technician
+from ..services.ghl_common import GHLCreds, get_ghl_creds
 
 settings = get_settings()
 log = logging.getLogger("3d-dispatch.notify")
@@ -37,28 +38,25 @@ def _message(ro: RepairOrder, vehicle: str) -> str:
     veh = f" — {vehicle}" if vehicle else ""
     return (
         f"New job: RO #{ro.ro_number}{veh} has been assigned to you. "
-        f"Open 3D Dispatch → My Work to start."
+        f"Open your jobs: {settings.app_base_url}/my-work"
     )
 
 
-def _headers() -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {settings.ghl_api_key}",
-        "Version": "2021-07-28",
-        "content-type": "application/json",
-    }
-
-
-async def _upsert_contact(client: httpx.AsyncClient, tech: Technician) -> str | None:
-    """Find-or-create the tech as a GHL contact; return the contact id."""
+async def _upsert_contact(
+    client: httpx.AsyncClient, creds: GHLCreds, tech: Technician
+) -> str | None:
+    """Find-or-create the tech as a GHL contact in this store's account; return
+    the contact id."""
     if tech.ghl_contact_id:
         return tech.ghl_contact_id
-    body: dict = {"locationId": settings.ghl_location_id, "name": tech.name, "tags": ["technician"]}
+    body: dict = {"locationId": creds.location_id, "name": tech.name, "tags": ["technician"]}
     if tech.phone:
         body["phone"] = tech.phone
     if tech.email:
         body["email"] = tech.email
-    r = await client.post(f"{settings.ghl_base}/contacts/upsert", json=body, headers=_headers())
+    r = await client.post(
+        f"{settings.ghl_base}/contacts/upsert", json=body, headers=creds.headers()
+    )
     if r.status_code >= 300:
         log.warning("GHL contact upsert failed (%s): %s", r.status_code, r.text[:200])
         return None
@@ -71,7 +69,8 @@ async def _upsert_contact(client: httpx.AsyncClient, tech: Technician) -> str | 
 
 
 async def _send_message(
-    client: httpx.AsyncClient, contact_id: str, channel: str, message: str, ro_number: str
+    client: httpx.AsyncClient, creds: GHLCreds, contact_id: str, channel: str,
+    message: str, ro_number: str,
 ) -> tuple[bool, str | None, str | None]:
     """Send via the Conversations API. Returns (ok, message_id, error)."""
     body: dict = {"type": channel, "contactId": contact_id, "message": message}
@@ -79,7 +78,7 @@ async def _send_message(
         body["subject"] = f"New job assigned — RO #{ro_number}"
         body["html"] = f"<p>{message}</p>"
     r = await client.post(
-        f"{settings.ghl_base}/conversations/messages", json=body, headers=_headers()
+        f"{settings.ghl_base}/conversations/messages", json=body, headers=creds.headers()
     )
     if r.status_code >= 300:
         return False, None, f"GHL responded {r.status_code}: {r.text[:150]}"
@@ -104,9 +103,13 @@ async def notify_tech_assignment(session: AsyncSession, assignment: Assignment) 
         return
     assignment.notify_channel = "SMS" if channel == "SMS" else "EMAIL"
 
-    if not settings.ghl_configured:
+    # Each store texts from its OWN GHL account, resolved by dealer. A Honda
+    # dispatch sends from Honda's number, never Acura's. A store with no GHL
+    # wired just queues the notification until its creds land.
+    creds = await get_ghl_creds(session, assignment.dealer_id)
+    if creds is None:
         assignment.notify_status = "queued"
-        assignment.notify_error = "GHL not configured yet (API key / location)"
+        assignment.notify_error = "This store's GHL isn't connected yet"
         await session.commit()
         return
 
@@ -115,11 +118,11 @@ async def notify_tech_assignment(session: AsyncSession, assignment: Assignment) 
     )
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
-            contact_id = await _upsert_contact(client, tech)
+            contact_id = await _upsert_contact(client, creds, tech)
             if not contact_id:
                 raise RuntimeError("could not create the tech's GHL contact")
             ok, msg_id, err = await _send_message(
-                client, contact_id, channel, _message(ro, vehicle), ro.ro_number
+                client, creds, contact_id, channel, _message(ro, vehicle), ro.ro_number
             )
         if ok:
             assignment.notify_status = "sent"

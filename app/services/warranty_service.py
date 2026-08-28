@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
 from ..db import SessionLocal
+from ..services.ghl_common import GHLCreds, get_ghl_creds, ghl_creds_by_location
 from ..models import (
     DEFAULT_WARRANTY_RUBRIC,
     WARRANTY_RESULTS,
@@ -385,12 +386,16 @@ async def audit_ro(
         job_type=job_type, audit_status=audit_status, findings=findings, source_ro_id=ro.id,
     )
 
-    # Best-effort mirror to GHL; never let a sync failure fail the audit.
+    # Best-effort mirror to GHL — into THIS store's own GHL account. Each store's
+    # creds are looked up by dealer, so a Honda audit lands in Honda's GHL and
+    # never in Acura's. A store with no GHL wired simply skips the push.
     if push_ghl:
-        try:
-            await sync_to_ghl(row)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("GHL sync failed for RO %s: %s", ro.ro_number, exc)
+        creds = await get_ghl_creds(session, dealer_id)
+        if creds is not None:
+            try:
+                await sync_to_ghl(row, creds)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("GHL sync failed for RO %s: %s", ro.ro_number, exc)
     return row
 
 
@@ -454,60 +459,57 @@ async def _download(url: str) -> tuple[bytes, str]:
 
 # check name -> GHL single-option field key (option keys are the result values).
 _GHL_CHECK_FIELDS = {c["name"]: c["key"] for c in DEFAULT_WARRANTY_RUBRIC}
+# Allowed option keys for the dropdown fields. GHL rejects the whole record if a
+# single-option field is sent a value outside its list (an empty string too), so
+# we only send these fields when the value is a real option.
+_RESULT_OPTIONS = {"pass", "needs_review", "fail", "na"}
+_JOB_TYPE_OPTIONS = {"warranty", "customer_pay", "internal", "service_contract"}
 
 
 def _ghl_props(row: WarrantyROAudit) -> dict[str, Any]:
     """Map our audit onto the GHL custom-object field keys (the section-6 shape).
-    Per-check fields are single-option; their option keys ARE our result values
-    (pass|needs_review|fail|na), and audit_status uses pending|pass|needs_review|fail."""
+    TEXT fields are always safe; single-option (dropdown) fields are only sent
+    when we hold a value that's actually one of their options — GHL 400s the
+    whole record on an out-of-list value (including an empty string)."""
     props: dict[str, Any] = {
-        "audit_status": row.audit_status,
+        "audit_status": row.audit_status,          # always pending|pass|needs_review|fail
         "findings_json": json.dumps(row.findings),
         "ro_number": row.ro_number,
-        "vin": row.vin or "",
-        "technician_id": row.technician_id or "",
-        "job_line_type": row.job_line_type or "",
+        "vin": row.vin or "",                      # TEXT — "" is fine
+        "technician_id": row.technician_id or "",  # TEXT — "" is fine
     }
+    # Job Line Type is a dropdown — only include it when classified.
+    if row.job_line_type in _JOB_TYPE_OPTIONS:
+        props["job_line_type"] = row.job_line_type
     for f in row.findings or []:
         key = _GHL_CHECK_FIELDS.get(f.get("check", ""))
-        if key:
-            props[key] = f.get("result", "needs_review")
+        result = f.get("result")
+        if key and result in _RESULT_OPTIONS:
+            props[key] = result
     return props
 
 
-def _ghl_headers() -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {settings.ghl_api_key}",
-        "Version": "2021-07-28",
-        "content-type": "application/json",
-    }
-
-
-async def sync_to_ghl(row: WarrantyROAudit) -> None:
-    """CREATE a GHL record — used when an audit originates in 3D Dispatch (there
-    is no GHL record yet)."""
-    if not settings.ghl_configured or not settings.ghl_object_key:
-        return
-    payload = {"locationId": settings.ghl_location_id, "properties": _ghl_props(row)}
-    url = f"{settings.ghl_base}/objects/{settings.ghl_object_key}/records"
+async def sync_to_ghl(row: WarrantyROAudit, creds: GHLCreds) -> None:
+    """CREATE a GHL record in the store's own account — used when an audit
+    originates in 3D Dispatch (there is no GHL record yet)."""
+    payload = {"locationId": creds.location_id, "properties": _ghl_props(row)}
+    url = f"{settings.ghl_base}/objects/{creds.object_key}/records"
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(url, json=payload, headers=_ghl_headers())
+        r = await client.post(url, json=payload, headers=creds.headers())
         if r.status_code >= 300:
             log.warning("GHL create failed (%s): %s", r.status_code, r.text[:200])
 
 
 async def push_audit_to_ghl(
-    record_id: str, row: WarrantyROAudit, callback_url: Optional[str] = None
+    record_id: str, row: WarrantyROAudit, creds: GHLCreds, callback_url: Optional[str] = None
 ) -> None:
-    """UPDATE an existing GHL record by id — the callback path (3b) so the write
-    lands on the record GHL already created on upload, and GHL's native activity
-    log attributes the change (section 8)."""
-    if not settings.ghl_configured:
-        return
-    url = callback_url or f"{settings.ghl_base}/objects/{settings.ghl_object_key}/records/{record_id}"
-    payload = {"locationId": settings.ghl_location_id, "properties": _ghl_props(row)}
+    """UPDATE an existing GHL record by id, in the store's own account — the
+    callback path (3b) so the write lands on the record GHL already created on
+    upload, and GHL's native activity log attributes the change (section 8)."""
+    url = callback_url or f"{settings.ghl_base}/objects/{creds.object_key}/records/{record_id}"
+    payload = {"locationId": creds.location_id, "properties": _ghl_props(row)}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.put(url, json=payload, headers=_ghl_headers())
+        r = await client.put(url, json=payload, headers=creds.headers())
         if r.status_code >= 300:
             log.warning("GHL update failed (%s): %s", r.status_code, r.text[:200])
 
@@ -517,37 +519,40 @@ async def push_audit_to_ghl(
 # --------------------------------------------------------------------------- #
 
 
-async def _dealer_for_ro(session: AsyncSession, ro_number: Optional[str]) -> tuple[Optional[uuid.UUID], Optional[RepairOrder]]:
-    """Resolve which store a webhook RO belongs to. If exactly one live RO
-    matches the number, use its store; otherwise fall back to the default store
-    (pilot is single-store) and audit from the uploaded file."""
-    if ro_number:
-        matches = (
-            await session.execute(select(RepairOrder).where(RepairOrder.ro_number == ro_number))
-        ).scalars().all()
-        if len(matches) == 1:
-            return matches[0].dealer_id, matches[0]
-        if len(matches) > 1:
-            log.warning("Webhook RO %s matches %d stores — using file path.", ro_number, len(matches))
-    row = (
+async def _ro_in_store(
+    session: AsyncSession, dealer_id: uuid.UUID, ro_number: Optional[str]
+) -> Optional[RepairOrder]:
+    """The live RO in THIS store matching the number, if any."""
+    if not ro_number:
+        return None
+    return (
         await session.execute(
-            select(Dealer.id).where(Dealer.dealer_key == settings.mykaarma_default_store_key)
+            select(RepairOrder).where(
+                RepairOrder.dealer_id == dealer_id,
+                RepairOrder.ro_number == ro_number,
+            )
         )
-    ).first()
-    return (row[0] if row else None), None
+    ).scalars().first()
 
 
 async def process_ghl_webhook(payload: dict) -> None:
-    """Run on upload: audit the RO (from our DB if we have it, else from the
-    uploaded file) and write the result back into the GHL record."""
+    """Run on upload: resolve which store this webhook is from (by its GHL
+    location id), audit the RO (from our DB if we have it, else from the uploaded
+    file), and write the result back into that store's OWN GHL record."""
     record_id = payload.get("record_id")
     callback_url = payload.get("callback_url")
     ro_number = payload.get("ro_number")
+    location_id = payload.get("location_id") or payload.get("locationId")
     async with SessionLocal() as session:
-        dealer_id, ro = await _dealer_for_ro(session, ro_number)
-        if dealer_id is None:
-            log.warning("GHL webhook: could not resolve a store for RO %s — skipped.", ro_number)
+        creds = await ghl_creds_by_location(session, location_id) if location_id else None
+        if creds is None:
+            log.warning(
+                "GHL webhook: no store matches location %s (RO %s) — skipped.",
+                location_id, ro_number,
+            )
             return
+        dealer_id = creds.dealer_id
+        ro = await _ro_in_store(session, dealer_id, ro_number)
         try:
             if ro is not None:
                 row = await audit_ro(session, dealer_id, ro, push_ghl=False)
@@ -558,6 +563,6 @@ async def process_ghl_webhook(payload: dict) -> None:
             return
         if record_id:
             try:
-                await push_audit_to_ghl(record_id, row, callback_url)
+                await push_audit_to_ghl(record_id, row, creds, callback_url)
             except Exception as exc:  # noqa: BLE001
                 log.warning("GHL write-back failed for RO %s: %s", ro_number, exc)

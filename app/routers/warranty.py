@@ -15,8 +15,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from ..config import get_settings
+from ..db import SessionLocal, utcnow
 from ..deps import CurrentUserDep, SessionDep
 from ..models import AuditLog, RepairOrder, WarrantyROAudit
+from ..services.ghl_common import ghl_creds_by_location
 from ..services.warranty_service import (
     WarrantyAuditError,
     audit_ro,
@@ -24,7 +26,6 @@ from ..services.warranty_service import (
     process_ghl_webhook,
     set_rubric,
 )
-from ..db import utcnow
 
 settings = get_settings()
 log = logging.getLogger("3d-dispatch.warranty")
@@ -181,17 +182,30 @@ async def review_audit(
 
 @router.post("/ghl/webhook")
 async def ghl_webhook(request: Request, background: BackgroundTasks, token: Optional[str] = None):
-    """Public endpoint GHL's 'Trigger on Upload' workflow calls. We are the
-    external processor: validate the shared secret, then audit + write back to
-    GHL in the background so GHL's workflow never waits on Claude (pattern 3b)."""
-    secret = settings.ghl_webhook_secret
-    provided = token or request.headers.get("X-Webhook-Secret")
-    if secret and provided != secret:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid webhook secret")
+    """Public endpoint each store's GHL 'Trigger on Upload' workflow calls. We are
+    the external processor. Multi-store: the payload carries the store's GHL
+    `location_id`, so we resolve which store it is, validate THAT store's shared
+    secret, then audit + write back in the background (pattern 3b) so GHL's
+    workflow never waits on Claude."""
     try:
         payload = await request.json()
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Body must be JSON") from exc
+
+    location_id = payload.get("location_id") or payload.get("locationId")
+    if not location_id:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Missing location_id — include the GHL Location Id in the webhook body.",
+        )
+    provided = token or request.headers.get("X-Webhook-Secret")
+    async with SessionLocal() as session:
+        creds = await ghl_creds_by_location(session, location_id)
+    if creds is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown store (location_id)")
+    if creds.webhook_secret and provided != creds.webhook_secret:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid webhook secret")
+
     background.add_task(process_ghl_webhook, payload)
     return {"status": "accepted", "ro_number": payload.get("ro_number")}
 
