@@ -505,11 +505,20 @@ async def push_audit_to_ghl(
 ) -> None:
     """UPDATE an existing GHL record by id, in the store's own account — the
     callback path (3b) so the write lands on the record GHL already created on
-    upload, and GHL's native activity log attributes the change (section 8)."""
-    url = callback_url or f"{settings.ghl_base}/objects/{creds.object_key}/records/{record_id}"
-    payload = {"locationId": creds.location_id, "properties": _ghl_props(row)}
+    upload, and GHL's native activity log attributes the change (section 8).
+
+    NOTE: unlike record *create* (POST, locationId in the body), record *update*
+    (PUT) wants locationId as a QUERY param and the body as just {properties}.
+    Sending locationId in the PUT body 422s the whole write-back."""
+    if callback_url:
+        url, params = callback_url, {}
+    else:
+        url = f"{settings.ghl_base}/objects/{creds.object_key}/records/{record_id}"
+        params = {"locationId": creds.location_id}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.put(url, json=payload, headers=creds.headers())
+        r = await client.put(
+            url, params=params, json={"properties": _ghl_props(row)}, headers=creds.headers()
+        )
         if r.status_code >= 300:
             log.warning("GHL update failed (%s): %s", r.status_code, r.text[:200])
 
