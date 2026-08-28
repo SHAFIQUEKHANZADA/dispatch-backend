@@ -399,6 +399,22 @@ async def audit_ro(
     return row
 
 
+async def run_batch_audit(dealer_id: uuid.UUID, ro_ids: list[uuid.UUID]) -> None:
+    """Audit a set of ROs in the background, each in its own committed step so a
+    mid-run failure never loses finished work. Opens its own session because the
+    web request that scheduled it has already returned (no token burn on a
+    browser timeout, and already-audited ROs were filtered out by the caller)."""
+    async with SessionLocal() as session:
+        for ro_id in ro_ids:
+            ro = await session.get(RepairOrder, ro_id)
+            if ro is None:
+                continue
+            try:
+                await audit_ro(session, dealer_id, ro)
+            except WarrantyAuditError as exc:
+                log.warning("Batch audit failed for RO %s: %s", ro.ro_number, exc)
+
+
 async def audit_file(session: AsyncSession, dealer_id: uuid.UUID, meta: dict) -> WarrantyROAudit:
     """Audit an uploaded RO scan/PDF (the secondary path) when the RO isn't in
     our live DB. Claude reads the document itself. `meta` carries known fields

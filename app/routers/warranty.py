@@ -24,6 +24,7 @@ from ..services.warranty_service import (
     audit_ro,
     get_rubric,
     process_ghl_webhook,
+    run_batch_audit,
     set_rubric,
 )
 
@@ -86,12 +87,34 @@ async def get_audit(audit_id: uuid.UUID, session: SessionDep, current: CurrentUs
 # routes in order, so a dynamic `/audit/{ro_id}` declared first would swallow the
 # literal "batch" and try to parse it as a UUID.
 @router.post("/audit/batch")
-async def audit_batch(session: SessionDep, current: CurrentUserDep, limit: Optional[int] = None):
-    """Audit the store's open ROs (capped). Warranty vs customer-pay is classified
-    per-RO by the auditor; the batch runs sequentially so a flaky network can't
-    lose work already committed. Truncation is reported, never silent."""
+async def audit_batch(
+    session: SessionDep, current: CurrentUserDep, background: BackgroundTasks,
+    limit: Optional[int] = None,
+):
+    """Audit the store's open ROs that HAVEN'T been audited yet (capped), in the
+    BACKGROUND. Two reasons this runs async and skips done ROs: a browser can't
+    wait minutes for 25 Claude calls (it times out with 'Failed to fetch' while
+    the server keeps burning tokens), and re-auditing an already-audited RO pays
+    Claude twice for the same answer. Returns immediately with how many were
+    queued; the page refreshes to show them as they land."""
+    if not settings.anthropic_configured:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "Anthropic key not configured — audits can't run.",
+        )
     cap = min(limit or settings.warranty_batch_cap, settings.warranty_batch_cap)
-    ros = list(
+
+    # ROs already audited for this store — skip them so a click doesn't re-spend.
+    done = set(
+        (
+            await session.execute(
+                select(WarrantyROAudit.ro_number).where(
+                    WarrantyROAudit.dealer_id == current.dealer_id
+                )
+            )
+        ).scalars()
+    )
+    open_ros = list(
         (
             await session.execute(
                 select(RepairOrder)
@@ -101,27 +124,21 @@ async def audit_batch(session: SessionDep, current: CurrentUserDep, limit: Optio
             )
         ).scalars()
     )
-    total = len(ros)
-    batch = ros[:cap]
-    audited, failed = 0, 0
-    for ro in batch:
-        try:
-            await audit_ro(session, current.dealer_id, ro)
-            audited += 1
-        except WarrantyAuditError as exc:
-            failed += 1
-            log.warning("Batch audit failed for RO %s: %s", ro.ro_number, exc)
-            if audited == 0 and failed == 1:
-                # First call failed hard (e.g. no API key) — stop and tell the user.
-                raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    pending = [ro for ro in open_ros if ro.ro_number not in done]
+    batch = pending[:cap]
 
-    truncated = max(0, total - len(batch))
-    msg = f"Audited {audited} RO(s)"
-    if failed:
-        msg += f", {failed} failed"
-    if truncated:
-        msg += f". Capped at {cap} — {truncated} more not audited this run."
-    return {"audited": audited, "failed": failed, "total_open": total, "capped_at": cap, "message": msg}
+    if not batch:
+        return {
+            "queued": 0,
+            "message": "All open ROs are already audited — nothing new to run.",
+        }
+
+    background.add_task(run_batch_audit, current.dealer_id, [ro.id for ro in batch])
+    remaining = max(0, len(pending) - len(batch))
+    msg = f"Auditing {len(batch)} new RO(s) in the background — this page will update as results land."
+    if remaining:
+        msg += f" ({remaining} more will need another run.)"
+    return {"queued": len(batch), "remaining": remaining, "message": msg}
 
 
 @router.post("/audit/{ro_id}")
