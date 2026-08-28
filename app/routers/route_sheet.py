@@ -114,6 +114,7 @@ async def get_route_sheet(session: SessionDep, current: CurrentUserDep):
     started: dict = {}
     started_at: dict = {}
     notified: dict = {}
+    completed_at: dict = {}
     for a, t in assigns:
         # keep the most recent assignment per RO
         prev = mech.get(a.ro_id)
@@ -122,12 +123,17 @@ async def get_route_sheet(session: SessionDep, current: CurrentUserDep):
             started[a.ro_id] = a.started_at is not None
             started_at[a.ro_id] = a.started_at
             notified[a.ro_id] = a.notify_status
+            completed_at[a.ro_id] = a.completed_at
 
     rows = []
     for ro in ros:
-        # completed ROs older than today are not on today's sheet
+        # completed ROs older than today are not on today's sheet — UNLESS they
+        # were completed today (a job finished today belongs on today's sheet,
+        # even if the RO itself was written a while ago).
         if ro.status == "COMPLETED" and ro.written_at and ro.written_at < day_start - timedelta(days=2):
-            continue
+            ca = completed_at.get(ro.id)
+            if not (ca and ca >= day_start):
+                continue
         carried = bool(ro.written_at and ro.written_at < day_start)
         st = _status(ro, started.get(ro.id, False), ro.id in mech)
         mechanic = mech.get(ro.id, (None, None))[0]
