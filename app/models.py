@@ -417,6 +417,26 @@ class MyKaarmaDealer(Base):
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
 
 
+class GHLDealer(Base):
+    """Per-store GoHighLevel credentials. Each McGrath store is its own GHL
+    sub-account (Location) with its own Private Integration Token, warranty
+    custom object, and webhook secret. This lets a Honda audit write back into
+    Honda's GHL and never into Acura's — one row per store, keyed by dealer."""
+
+    __tablename__ = "ghl_dealers"
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("dealers.id", ondelete="CASCADE"), primary_key=True
+    )
+    api_key: Mapped[str] = mapped_column(Text, nullable=False)          # Private Integration Token (pit-...)
+    location_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    object_key: Mapped[str] = mapped_column(Text, default="custom_objects.warranty_ro_audits")
+    object_id: Mapped[Optional[str]] = mapped_column(Text)
+    webhook_secret: Mapped[Optional[str]] = mapped_column(Text)          # shared secret GHL sends on the upload webhook
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
+
+
 class ImportRun(Base):
     __tablename__ = "import_runs"
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)

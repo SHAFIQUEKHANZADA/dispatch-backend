@@ -32,6 +32,8 @@ class Settings(BaseSettings):
         "https://dispatch-kohl-pi.vercel.app, http://localhost:3000"
     )
     api_prefix: str = "/api"
+    # Public app URL, used to build the tappable link in the tech's SMS.
+    app_base_url: str = "https://get3ddispatch.com"
 
     # Demo clock.  When set (ISO 8601), the app scores "now" against this instant
     # instead of the wall clock, so the demo board is alive at any hour and the
@@ -73,6 +75,10 @@ class Settings(BaseSettings):
     # Shared secret GHL sends with its upload webhook (in ?token= or an
     # X-Webhook-Secret header) so the public endpoint can't be hit by anyone.
     ghl_webhook_secret: str = ""
+    # The single store the global GHL creds above belong to. Until per-store GHL
+    # is wired, ALL GHL push (warranty write-back + tech SMS) happens ONLY for
+    # this store — so Honda audits/texts never land in the Acura GHL account.
+    ghl_default_store_key: str = "mcgrath_acura_mortongrove"
     # Inbound-webhook trigger URL of the GHL workflow that texts/emails the tech
     # when a job is assigned. Our backend POSTs the tech + RO here; GHL's carrier
     # connect sends the SMS. Empty = notifications are tracked but not yet sent.
