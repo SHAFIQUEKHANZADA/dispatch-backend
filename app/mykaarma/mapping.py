@@ -236,10 +236,18 @@ def map_order(payload: dict) -> MappedRO:
             continue
         blocked = line_waiting_on_parts(job)
         any_parts_block = any_parts_block or blocked
-        # myKaarma's field is `techNos` (plural), sometimes comma/slash separated.
-        raw_tech = job.get("techNos") or job.get("techNo") or job.get("technicianNumber") or ""
-        line_techs = [tn.strip() for tn in str(raw_tech).replace("/", ",").split(",") if tn.strip()]
+        # The technician lives in techHours[].techNo. myKaarma's top-level `techNos`
+        # is usually blank, so read the per-tech breakdown first, then fall back.
+        tech_hours = job.get("techHours") or []
+        line_techs = [str(th.get("techNo")).strip() for th in tech_hours if th.get("techNo")]
+        if not line_techs:
+            raw_tech = job.get("techNos") or job.get("techNo") or job.get("technicianNumber") or ""
+            line_techs = [tn.strip() for tn in str(raw_tech).replace("/", ",").split(",") if tn.strip()]
         tech_nos.extend(line_techs)
+        # Punch time: prefer the job-level actualHours, else sum the per-tech punches.
+        actual = _num(job.get("actualHours"))
+        if actual == 0 and tech_hours:
+            actual = sum(_num(th.get("actualHours")) for th in tech_hours)
         lines.append(
             MappedLine(
                 op_code=(str(job.get("laborOpCode")).strip() if job.get("laborOpCode") else None),
@@ -254,7 +262,7 @@ def map_order(payload: dict) -> MappedRO:
                 tech_no=(line_techs[0] if line_techs else None),
                 dispatch_line_status=job.get("dispatchLineStatus"),
                 waiting_on_parts=blocked,
-                actual_hours=_num(job.get("actualHours")),
+                actual_hours=actual,
                 parts_count=_count_parts(job),
             )
         )
