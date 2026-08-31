@@ -122,7 +122,19 @@ async def _ro_context(session: AsyncSession, ro: RepairOrder) -> dict:
             {
                 "op_code": ln.op_code,
                 "description": ln.description,
-                "flagged_hours": float(ln.flagged_hours or 0),
+                "labor_type": ln.labor_type,                 # WARRANTY | CP | INTERNAL
+                "technician_dms_no": ln.tech_no,             # DMS tech who did this line
+                "booked_hours": float(ln.flagged_hours or 0),   # claimed labor
+                # Punch time only when it was actually recorded; None = no punch
+                # data (→ needs_review), NOT a real zero (which the 60% rule would
+                # read as a fail).
+                "punch_hours": (float(ln.actual_hours) if float(ln.actual_hours or 0) > 0 else None),
+                "punch_pct_of_booked": (
+                    round(float(ln.actual_hours) / float(ln.flagged_hours) * 100)
+                    if float(ln.actual_hours or 0) > 0 and float(ln.flagged_hours or 0) > 0
+                    else None
+                ),
+                "parts_documented": int(ln.parts_count or 0),
             }
             for ln in ro.lines
         ],
@@ -156,6 +168,20 @@ def _system_prompt(rubric: list[dict]) -> str:
     for i, c in enumerate(rubric, 1):
         lines.append(f"  {i}. {c['name']} — {c.get('needs','')} (DOM: {c.get('dom_section','')})")
     lines += [
+        "",
+        "SPECIFIC RULES (from the dealership's warranty admin — apply these exactly):",
+        "  * Straight-Time/DPSM Authorization: standard flat-rate warranty labor does NOT "
+        "require straight-time or DPSM authorization. If the RO shows no straight-time "
+        "(hourly) labor and no DPSM special claim, mark this check 'na' — do NOT mark it "
+        "'needs_review'. Only flag it when straight-time/DPSM work is actually present.",
+        "  * Punch Records vs Claimed Time: if actual/punch hours are provided, PASS when "
+        "punch time is >= 60% of the booked (flagged) hours, and FAIL when it is under 60%. "
+        "Only mark 'needs_review' if no punch/actual hours are provided at all.",
+        "  * Parts Documentation: if any parts are listed on the RO lines/invoice, mark "
+        "'pass'. If the repair genuinely needs no parts, mark 'na'. Only 'needs_review' when "
+        "a repair clearly required parts but none are listed.",
+        "  * Technician ID Match: if a technician (number or name) is identified on the job "
+        "lines, mark 'pass'. Only 'needs_review' when no tech is on the job at all.",
         "",
         "Also determine job_line_type: one of 'Warranty', 'Customer Pay', "
         "'Internal', 'Service Contract' — or 'Unknown' if the data doesn't say.",

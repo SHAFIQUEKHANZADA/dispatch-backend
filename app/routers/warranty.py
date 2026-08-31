@@ -13,6 +13,7 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from ..config import get_settings
 from ..db import SessionLocal, utcnow
@@ -118,13 +119,23 @@ async def audit_batch(
         (
             await session.execute(
                 select(RepairOrder)
+                .options(selectinload(RepairOrder.lines))
                 .where(RepairOrder.dealer_id == current.dealer_id)
                 .where(RepairOrder.status.notin_(["COMPLETED"]))
                 .order_by(RepairOrder.written_at.desc())
             )
         ).scalars()
     )
-    pending = [ro for ro in open_ros if ro.ro_number not in done]
+    # Only warranty-relevant ROs (Michael's ask): keep an RO if it has a warranty
+    # line, or if its lines have no labor type yet (not synced) — never exclude on
+    # missing data. ROs that are known to be all customer-pay/internal are skipped.
+    def _warranty_relevant(ro: RepairOrder) -> bool:
+        known = [ln.labor_type for ln in ro.lines if ln.labor_type]
+        return (not known) or ("WARRANTY" in known)
+
+    pending = [
+        ro for ro in open_ros if ro.ro_number not in done and _warranty_relevant(ro)
+    ]
     batch = pending[:cap]
 
     if not batch:
