@@ -135,6 +135,78 @@ DEFAULT_SCOREBOARD_CONFIG = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# Specialty wheel (the rim-and-tire graph on the tech profile)                 #
+#                                                                              #
+# Scores are SET BY the manager/tech — a point BUDGET spent across categories, #
+# each with a floor and ceiling — NOT derived from RO data. Per-level budgets  #
+# so a Senior Master carries more total mastery than an apprentice, and a      #
+# floor so nobody is a zero (matches the owner's build: "every category holds  #
+# a floor"). Lube techs get their own category set.                            #
+# --------------------------------------------------------------------------- #
+_MAIN_SPECIALTIES = [
+    "Engine", "Transmission", "Diagnostics", "Drivability", "Electrical", "Brakes", "HVAC",
+]
+_LUBE_SPECIALTIES = [
+    "Oil & Filter", "Tires", "Brakes", "Inspection", "Fluids", "Battery",
+]
+
+# skill_level -> {total budget, per-category floor, per-category ceiling}
+DEFAULT_SPECIALTY_CONFIG = {
+    "levels": {
+        "Sr. Master":      {"total": 500, "floor": 38, "ceiling": 95},
+        "Master":          {"total": 455, "floor": 34, "ceiling": 92},
+        "Diagnostic Tech": {"total": 410, "floor": 30, "ceiling": 90},
+        "General Tech":    {"total": 365, "floor": 26, "ceiling": 85},
+        "Apprentice 3":    {"total": 320, "floor": 22, "ceiling": 78},
+        "Apprentice 2":    {"total": 285, "floor": 20, "ceiling": 70},
+        "Apprentice 1":    {"total": 250, "floor": 18, "ceiling": 62},
+    },
+    "default_level": {"total": 400, "floor": 30, "ceiling": 90},
+    "lube": {"total": 300, "floor": 25, "ceiling": 90},
+}
+
+
+def resolve_specialty_config(team: Optional[str], skill_level: Optional[str], override: Optional[dict] = None) -> dict:
+    """The wheel's categories + point budget for a given tech, honoring a
+    per-dealer override (future Store Settings UI) over the built-in defaults."""
+    cfg = override or DEFAULT_SPECIALTY_CONFIG
+    if (team or "") == "Lube":
+        budget = cfg.get("lube", DEFAULT_SPECIALTY_CONFIG["lube"])
+        categories = list(_LUBE_SPECIALTIES)
+    else:
+        levels = cfg.get("levels", DEFAULT_SPECIALTY_CONFIG["levels"])
+        budget = levels.get(
+            skill_level or "", cfg.get("default_level", DEFAULT_SPECIALTY_CONFIG["default_level"])
+        )
+        categories = list(_MAIN_SPECIALTIES)
+    return {
+        "categories": categories,
+        "total": int(budget["total"]),
+        "floor": int(budget["floor"]),
+        "ceiling": int(budget["ceiling"]),
+    }
+
+
+def default_specialty_scores(cfg: dict) -> dict[str, int]:
+    """An even, floor-and-ceiling-clamped split of the budget across the
+    categories — the starting wheel before the manager tunes it."""
+    cats = cfg["categories"]
+    n = len(cats)
+    base = min(cfg["ceiling"], max(cfg["floor"], cfg["total"] // n))
+    scores = {c: base for c in cats}
+    # spread whatever budget is left (top-to-bottom) without exceeding the ceiling
+    remaining = cfg["total"] - base * n
+    i = 0
+    while remaining > 0 and i < n * 60:
+        c = cats[i % n]
+        if scores[c] < cfg["ceiling"]:
+            scores[c] += 1
+            remaining -= 1
+        i += 1
+    return scores
+
+
 class DealerSettings(Base):
     __tablename__ = "dealer_settings"
     dealer_id: Mapped[uuid.UUID] = mapped_column(
@@ -143,6 +215,9 @@ class DealerSettings(Base):
     match_weights: Mapped[dict] = mapped_column(JSONBType(), default=lambda: dict(DEFAULT_MATCH_WEIGHTS))
     store_config: Mapped[dict] = mapped_column(JSONBType(), default=lambda: copy.deepcopy(DEFAULT_STORE_CONFIG))
     scoreboard_config: Mapped[dict] = mapped_column(JSONBType(), default=lambda: copy.deepcopy(DEFAULT_SCOREBOARD_CONFIG))
+    # Per-level specialty-wheel budgets (null -> DEFAULT_SPECIALTY_CONFIG). Future
+    # Store Settings UI writes this; the resolver reads it via override.
+    specialty_config: Mapped[Optional[dict]] = mapped_column(JSONBType())
     enforce_team_separation: Mapped[bool] = mapped_column(Boolean, default=True)
     min_ros_to_rank: Mapped[int] = mapped_column(Integer, default=10)
     min_flagged_hours_to_rank: Mapped[float] = mapped_column(Numeric, default=15)
@@ -194,6 +269,10 @@ class Technician(Base):
     bio_reviewed_label: Mapped[Optional[str]] = mapped_column(Text)    # "Apr 2026", "Jun 2026 (hire)"
     bio_submitted_label: Mapped[Optional[str]] = mapped_column(Text)   # "Jun 22, 2026"
     pending_bio: Mapped[Optional[dict]] = mapped_column(JSONBType())   # the submitted update card, or null
+    # Specialty-wheel scores: {category: 0-100}, manager-set within a budget.
+    # Empty/None -> the profile falls back to an even default split (see
+    # default_specialty_scores). Never derived from RO data.
+    specialty_scores: Mapped[Optional[dict]] = mapped_column(JSONBType())
 
     shift_start: Mapped[Optional[time]] = mapped_column(Time)
     shift_end: Mapped[Optional[time]] = mapped_column(Time)

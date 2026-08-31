@@ -267,6 +267,24 @@ async def update_manual_entry(body: ManualEntryIn, session: SessionDep, current:
     return await get_scoreboard_settings(session, current)
 
 
+@router.get("/advisor/{advisor_id}")
+async def advisor_detail(advisor_id: uuid.UUID, session: SessionDep, current: CurrentUserDep):
+    """One advisor's review page — their KPIs, rank, goals, and a short sales
+    trend. Reuses the advisor board so the numbers match the leaderboard exactly."""
+    board = await _advisor_board(session, current.dealer_id)
+    row = next((r for r in board["rows"] if r["advisor_id"] == str(advisor_id)), None)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Advisor not found")
+    return {
+        "advisor": row,
+        "total": len(board["rows"]),
+        "rank_key": board["rank_key"],
+        "columns": board["columns"],
+        "goals": board["goals"],
+        "store": board["store"],
+    }
+
+
 @router.get("/board")
 async def scoreboard_board(
     session: SessionDep, current: CurrentUserDep, view: str = "technicians", period: str = "T90"
