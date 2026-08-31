@@ -13,12 +13,14 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
 from .. import audit
-from ..deps import CurrentUserDep, SessionDep
+from ..deps import CurrentUserDep, SessionDep, get_dealer_settings
 from ..models import (
     Technician,
     TechnicianCert,
     TechnicianRestriction,
     TechnicianSpecialty,
+    default_specialty_scores,
+    resolve_specialty_config,
 )
 from ..services.dispatch_service import (
     load_shop,
@@ -553,6 +555,191 @@ async def update_assignment(
             ro.status = "COMPLETED"
     await session.commit()
     return {"assignment_id": str(a.id), "action": action, "ok": True}
+
+
+async def _specialty_block(session, t: Technician) -> dict:
+    """The rim-and-tire wheel's config + this tech's scores. Unset categories
+    fall back to an even default split so a brand-new tech still shows a wheel."""
+    ds = await get_dealer_settings(session, t.dealer_id)
+    cfg = resolve_specialty_config(t.team, t.skill_level, getattr(ds, "specialty_config", None))
+    saved = t.specialty_scores or {}
+    defaults = default_specialty_scores(cfg)
+    scores: dict[str, int] = {}
+    for c in cfg["categories"]:
+        v = saved.get(c)
+        scores[c] = int(v) if isinstance(v, (int, float)) else defaults[c]
+    used = sum(scores.values())
+    return {
+        **cfg,
+        "scores": scores,
+        "points_used": used,
+        "points_remaining": cfg["total"] - used,
+        "is_default": not bool(saved),
+    }
+
+
+class SpecialtyScoresIn(BaseModel):
+    scores: dict[str, int]
+
+
+@router.put("/{tech_id}/specialties")
+async def update_specialties(
+    tech_id: uuid.UUID, body: SpecialtyScoresIn, session: SessionDep, current: CurrentUserDep
+):
+    """Save the manager-tuned specialty wheel. Enforces the tech's level budget:
+    every category within [floor, ceiling] and the total spent within the level's
+    point budget (matches the owner's 'raise one area by lowering another')."""
+    current.require_role("SERVICE_MANAGER")
+    t = await session.get(Technician, tech_id)
+    if t is None or t.dealer_id != current.dealer_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Technician not found")
+
+    ds = await get_dealer_settings(session, current.dealer_id)
+    cfg = resolve_specialty_config(t.team, t.skill_level, getattr(ds, "specialty_config", None))
+
+    clean: dict[str, int] = {}
+    for c in cfg["categories"]:
+        if c not in body.scores:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Missing a score for {c}.")
+        v = int(body.scores[c])
+        if v < cfg["floor"] or v > cfg["ceiling"]:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"{c} must be between {cfg['floor']} and {cfg['ceiling']}.",
+            )
+        clean[c] = v
+    used = sum(clean.values())
+    if used > cfg["total"]:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Over budget by {used - cfg['total']} points — lower one area to raise another.",
+        )
+
+    t.specialty_scores = clean
+    await audit.record(
+        session, dealer_id=current.dealer_id, actor=current.user_id,
+        action=audit.TECH_UPDATED, entity="technician_specialties", entity_id=t.id,
+        payload={"name": t.name, "points_used": used, "budget": cfg["total"]},
+    )
+    await session.commit()
+    await session.refresh(t)
+    return await _specialty_block(session, t)
+
+
+@router.get("/{tech_id}/profile")
+async def technician_profile(tech_id: uuid.UUID, session: SessionDep, current: CurrentUserDep):
+    """The tech's public profile card — roster identity (role, certs, specialties,
+    shift) plus their REAL 90-day performance from the scoreboard engine. Same
+    numbers as the Service Scoreboard; nothing here is fabricated. A metric with
+    no data source returns available=false with a named reason (Guardian rule),
+    so the page can say 'no clock feed' instead of inventing a percentage."""
+    t = await session.get(Technician, tech_id)
+    if t is None or t.dealer_id != current.dealer_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Technician not found")
+
+    identity = _tech_dict(t)
+    specialty = await _specialty_block(session, t)
+    # NOTE: performance stats are fetched separately (GET .../stats) so this page
+    # renders instantly instead of blocking on the ~2s scorecard query.
+    return {**identity, "specialty": specialty}
+
+
+@router.get("/{tech_id}/stats")
+async def technician_stats(tech_id: uuid.UUID, session: SessionDep, current: CurrentUserDep):
+    """This tech's real 90-day performance (same engine as the Scoreboard, scored
+    for one tech only). Loaded separately from the profile so the page paints
+    immediately and the numbers fill in a beat later. Metrics with no data source
+    return available=false with a named reason (Guardian) — never fabricated."""
+    t = await session.get(Technician, tech_id)
+    if t is None or t.dealer_id != current.dealer_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Technician not found")
+
+    from ..services.metrics_service import single_scorecard
+
+    card = await single_scorecard(session, current.dealer_id, t.id, "T90")
+    if card is None:
+        return {"stats": None}
+    cd = card.to_dict()
+    return {
+        "stats": {
+            "period_label": "Last 90 days",
+            "ro_count": cd["ro_count"],
+            "flagged_hours": cd["flagged_hours"],
+            "cp_flagged_hours": cd["cp_flagged_hours"],
+            "warranty_flagged_hours": cd["warranty_flagged_hours"],
+            "internal_flagged_hours": cd["internal_flagged_hours"],
+            "qualifies_for_ranking": cd["qualifies_for_ranking"],
+            "metrics": cd["metrics"],
+            "data_issues": cd["data_issues"],
+        }
+    }
+
+
+@router.get("/{tech_id}/dispatch-options")
+async def dispatch_options(
+    tech_id: uuid.UUID, session: SessionDep, current: CurrentUserDep, limit: int = 6
+):
+    """Reverse dispatch: the best Ready-to-Dispatch ROs for THIS tech, scored by
+    the same engine as the board (with WHY reasons). Powers the dashboard panel
+    that opens when the dispatcher clicks a tech's open time — one click assigns."""
+    shop = await load_shop(session, current.dealer_id)
+    t = next((x for x in shop.technicians if x.id == tech_id), None)
+    if t is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Technician not found")
+
+    ready = list(
+        (
+            await session.execute(
+                select(RepairOrder).where(
+                    RepairOrder.dealer_id == current.dealer_id,
+                    RepairOrder.status == "READY_TO_DISPATCH",
+                )
+            )
+        ).scalars()
+    )
+
+    scored: list[tuple[RepairOrder, object]] = []
+    for ro in ready:
+        ro_in = ro_to_input(ro)
+        ctx = shop.context(ro.concern_category)
+        tech_input = next(
+            (x for x in techs_for_ro(shop, ro) if uuid.UUID(x.id) == t.id), None
+        )
+        if tech_input is None:
+            continue
+        if check_hard_constraints(ro_in, tech_input, ctx) is not None:
+            continue
+        scored.append((ro, score_technician(ro_in, tech_input, ctx)))
+
+    scored.sort(key=lambda p: -p[1].score)
+    total = len(scored)
+    options = [
+        {
+            "ro_id": str(ro.id),
+            "ro_number": ro.ro_number,
+            "vehicle": " ".join(
+                str(x) for x in (ro.vehicle_year, ro.vehicle_make, ro.vehicle_model) if x
+            ),
+            "concern": ro.concern_category,
+            "concern_short": (ro.lines[0].description if ro.lines else ro.concern_category),
+            "priority": ro.priority,
+            "is_flagged": ro.is_flagged,
+            "est_hours": float(ro.est_hours or 0),
+            "score": cand.score,
+            "best_fit": cand.best_fit,
+            "confident": cand.confident,
+            "reasons": [r.to_dict() for r in cand.reasons if r.text],
+            "warnings": cand.warnings,
+        }
+        for ro, cand in scored[: max(1, limit)]
+    ]
+    return {
+        "technician_id": str(t.id),
+        "name": t.name,
+        "initials": "".join(p[0] for p in t.name.split()[:2]).upper(),
+        "total_matches": total,
+        "options": options,
+    }
 
 
 @router.get("/{tech_id}")

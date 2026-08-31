@@ -53,6 +53,127 @@ METRIC_WINDOWS = {
 }
 
 
+async def single_scorecard(
+    session: AsyncSession,
+    dealer_id: uuid.UUID,
+    technician_id: uuid.UUID,
+    period: str = "T90",
+    now: Optional[datetime] = None,
+) -> Optional[TechScorecard]:
+    """One tech's scorecard WITHOUT scoring the whole store. The tech profile
+    needs a single card; running the full build_scoreboard (every tech, every
+    history row) took ~6s and made the profile page look hung. This filters the
+    history to just this tech, so it returns in well under a second."""
+    now = now or default_now()
+    tech = await session.get(Technician, technician_id)
+    if tech is None or tech.dealer_id != dealer_id:
+        return None
+
+    dealer = await session.get(Dealer, dealer_id)
+    ds = await session.get(DealerSettings, dealer_id) or DealerSettings(dealer_id=dealer_id)
+    tz = ZoneInfo(dealer.timezone or "America/Chicago") if dealer else ZoneInfo("UTC")
+    today = now.astimezone(tz).date()
+    start_d, end_d = period_bounds(period, today)
+    start_dt = datetime.combine(start_d, time(0, 0), tzinfo=tz).astimezone(timezone.utc)
+    end_dt = (datetime.combine(end_d, time(0, 0), tzinfo=tz) + timedelta(days=1)).astimezone(timezone.utc)
+
+    config = MetricsConfig(
+        min_ros_to_rank=int(ds.min_ros_to_rank or 10),
+        min_flagged_hours_to_rank=float(ds.min_flagged_hours_to_rank or 15),
+        comeback_window_days=int(ds.comeback_window_days or 30),
+        data_staleness_hours=int(ds.data_staleness_hours or 48),
+    )
+
+    excluded_ops = {
+        r.op_code
+        for r in (
+            await session.execute(
+                select(OpCodeMap).where(
+                    OpCodeMap.dealer_id == dealer_id, OpCodeMap.excluded.is_(True)
+                )
+            )
+        ).scalars()
+    }
+
+    hist = list(
+        (
+            await session.execute(
+                select(ROHistory).where(
+                    ROHistory.dealer_id == dealer_id,
+                    ROHistory.technician_id == technician_id,
+                    ROHistory.closed_at.is_not(None),
+                    ROHistory.closed_at >= start_dt,
+                    ROHistory.closed_at < end_dt,
+                )
+            )
+        ).scalars()
+    )
+    rows: list[HistoryRow] = []
+    for h in hist:
+        row = HistoryRow(
+            id=str(h.id),
+            ro_number=h.ro_number,
+            technician_id=str(h.technician_id),
+            opened_at=h.opened_at,
+            closed_at=h.closed_at,
+            concern_category=h.concern_category,
+            op_code=h.op_code,
+            flagged_hours=float(h.flagged_hours or 0),
+            actual_clocked_hours=float(h.actual_clocked_hours or 0),
+            labor_type=h.labor_type,
+            promise_time=h.promise_time,
+            vin=h.vin,
+            excluded_from_metrics=bool(h.excluded_from_metrics) or (h.op_code in excluded_ops),
+            exclusion_reason=h.exclusion_reason,
+        )
+        if is_countable(row):
+            rows.append(row)
+
+    comeback_count = (
+        await session.execute(
+            select(func.count()).select_from(ComebackPairRow).where(
+                ComebackPairRow.dealer_id == dealer_id,
+                ComebackPairRow.original_tech_id == technician_id,
+                ComebackPairRow.original_closed_at >= start_dt,
+                ComebackPairRow.original_closed_at < end_dt,
+            )
+        )
+    ).scalar() or 0
+
+    clocked_total = (
+        await session.execute(
+            select(func.sum(TimeClockDay.total_clocked_hours)).where(
+                TimeClockDay.dealer_id == dealer_id,
+                TimeClockDay.technician_id == technician_id,
+                TimeClockDay.work_date >= start_d,
+                TimeClockDay.work_date <= end_d,
+            )
+        )
+    ).scalar()
+
+    capacity = shift_capacity_hours(
+        start_d, end_d, tech.shift_start, tech.shift_end, tech.work_days or [],
+        tech.lunch_start, tech.lunch_end,
+    )
+    age = await _source_age_hours(session, dealer_id, now)
+
+    return build_scorecard(
+        technician_id=str(tech.id),
+        name=tech.name,
+        team=tech.team,
+        skill_level=tech.skill_level,
+        period=period,
+        period_start=start_d,
+        period_end=end_d,
+        rows=rows,
+        capacity_hours=capacity,
+        total_clocked_hours=float(clocked_total) if clocked_total is not None else None,
+        comeback_count=int(comeback_count),
+        config=config,
+        source_data_age_hours=age,
+    )
+
+
 def period_bounds(period: str, today: date) -> tuple[date, date]:
     if period == "DAILY":
         return today, today
