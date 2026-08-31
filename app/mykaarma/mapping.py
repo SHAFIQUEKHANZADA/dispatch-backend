@@ -57,11 +57,13 @@ STATUS_MAP: dict[str, str] = {
 class MappedLine:
     op_code: Optional[str]
     description: str
-    flagged_hours: float
+    flagged_hours: float               # soldHours = booked/claimed labor
     labor_type: Optional[str]          # CP | WARRANTY | INTERNAL
     tech_no: Optional[str]             # DMS tech on this line (drift detection)
     dispatch_line_status: Optional[str]
     waiting_on_parts: bool
+    actual_hours: float = 0.0          # actualHours = punch/clock time on the job
+    parts_count: int = 0               # how many parts are documented on the line
 
 
 @dataclass
@@ -182,12 +184,27 @@ def _is_boilerplate_line(op_code: Any, desc: Any) -> bool:
 
 def line_waiting_on_parts(job: dict) -> bool:
     """A line is parts-blocked when any part has been ordered but not sold/filled."""
-    for p in job.get("parts", []) or []:
+    for p in _parts_list(job):
         ordered = _num(p.get("quantityOrdered"))
         sold = _num(p.get("quantitySold"))
         if ordered > sold:
             return True
     return False
+
+
+def _parts_list(job: dict) -> list[dict]:
+    """myKaarma's `parts` can be a list, or the string 'None' when there are none."""
+    p = job.get("parts")
+    return p if isinstance(p, list) else []
+
+
+def _count_parts(job: dict) -> int:
+    """How many real parts are documented on the job (a part number or a quantity)."""
+    n = 0
+    for p in _parts_list(job):
+        if str(p.get("partNumber") or "").strip() or _num(p.get("quantityOrdered")) or _num(p.get("quantitySold")):
+            n += 1
+    return n
 
 
 # --------------------------------------------------------------------------- #
@@ -237,6 +254,8 @@ def map_order(payload: dict) -> MappedRO:
                 tech_no=(line_techs[0] if line_techs else None),
                 dispatch_line_status=job.get("dispatchLineStatus"),
                 waiting_on_parts=blocked,
+                actual_hours=_num(job.get("actualHours")),
+                parts_count=_count_parts(job),
             )
         )
 

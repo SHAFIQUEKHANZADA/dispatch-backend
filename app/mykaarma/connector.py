@@ -721,6 +721,10 @@ async def ingest_order(session: AsyncSession, dealer_id: uuid.UUID, payload: dic
                 description=l.description,
                 flagged_hours=_dec(l.flagged_hours),
                 sort_order=i,
+                labor_type=l.labor_type,
+                tech_no=l.tech_no,
+                actual_hours=_dec(l.actual_hours),
+                parts_count=l.parts_count,
             )
         )
 

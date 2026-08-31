@@ -332,8 +332,13 @@ class ROLine(Base):
     )
     op_code: Mapped[Optional[str]] = mapped_column(Text)
     description: Mapped[str] = mapped_column(Text, nullable=False)
-    flagged_hours: Mapped[float] = mapped_column(Numeric, default=0)
+    flagged_hours: Mapped[float] = mapped_column(Numeric, default=0)   # soldHours = booked
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    # Warranty-audit signals from the DMS (populated on the next myKaarma sync):
+    labor_type: Mapped[Optional[str]] = mapped_column(Text)            # CP | WARRANTY | INTERNAL
+    tech_no: Mapped[Optional[str]] = mapped_column(Text)               # DMS tech on the line
+    actual_hours: Mapped[float] = mapped_column(Numeric, default=0)    # actualHours = punch/clock
+    parts_count: Mapped[int] = mapped_column(Integer, default=0)       # documented parts on the line
 
 
 # ============================ HISTORY ====================================== #
@@ -618,16 +623,21 @@ DEFAULT_WARRANTY_RUBRIC = [
      "needs": "Mileage recorded and customer authorization present.",
      "dom_section": "RO header / signature"},
     {"key": "technician_id_match", "name": "Technician ID Match",
-     "needs": "The tech who did the work is identified and matches the claim.",
+     "needs": "A technician (tech number/name) is identified on the RO's job lines. PASS if a "
+              "tech is identified; needs_review only if no tech is on the job at all.",
      "dom_section": "Job line tech"},
     {"key": "labor_ops__hours", "name": "Labor Ops & Hours",
      "needs": "Labor op codes and claimed hours documented and valid.",
      "dom_section": "Job / labor lines"},
     {"key": "punch_records_vs_claimed_time", "name": "Punch Records vs Claimed Time",
-     "needs": "Actual punch/clock time supports the claimed labor time.",
+     "needs": "Actual punch/clock time is at least 60% of the booked (flagged) labor hours "
+              "for the job. PASS if punch >= 60% of booked; FAIL if punch is under 60%; "
+              "needs_review only when no punch/clock data is available at all.",
      "dom_section": "Time punch records"},
     {"key": "parts_documentation", "name": "Parts Documentation",
-     "needs": "Parts listed with part numbers/quantities; defective parts noted if required.",
+     "needs": "Parts used in the repair are listed on the RO/invoice. PASS if parts appear on "
+              "the lines; N/A if the repair needs no parts; needs_review only when a repair "
+              "clearly required parts but none are listed.",
      "dom_section": "Parts lines"},
     {"key": "dtc__ihds_documentation", "name": "DTC / i-HDS Documentation",
      "needs": "Diagnostic codes / i-HDS session documented where applicable.",
@@ -642,7 +652,10 @@ DEFAULT_WARRANTY_RUBRIC = [
      "needs": "Sublet invoices attached and documented for sublet work.",
      "dom_section": "Sublet lines"},
     {"key": "straighttimedpsm_authorization", "name": "Straight-Time/DPSM Authorization",
-     "needs": "DPSM or straight-time authorization present where required.",
+     "needs": "Applies ONLY when the RO has straight-time (hourly, non-flat-rate) labor or a "
+              "DPSM-authorized special claim. Standard flat-rate warranty labor does NOT need "
+              "it — mark N/A. Only needs_review/fail if straight-time/DPSM work is present but "
+              "its authorization is missing.",
      "dom_section": "DPSM authorization"},
 ]
 
