@@ -127,12 +127,12 @@ async def audit_batch(
             )
         ).scalars()
     )
-    # Only warranty-relevant ROs (Michael's ask): keep an RO if it has a warranty
-    # line, or if its lines have no labor type yet (not synced) — never exclude on
-    # missing data. ROs that are known to be all customer-pay/internal are skipped.
+    # Only warranty ROs (Michael's #1): audit an RO only when it has a WARRANTY
+    # labor line. Now that labor type is synced from the DMS, this excludes the
+    # customer-pay/internal ROs that otherwise flood the batch. (Service-contract
+    # / VSC will be added here once Michael tells us how the DMS marks it.)
     def _warranty_relevant(ro: RepairOrder) -> bool:
-        known = [ln.labor_type for ln in ro.lines if ln.labor_type]
-        return (not known) or ("WARRANTY" in known)
+        return any(ln.labor_type == "WARRANTY" for ln in ro.lines)
 
     pending = [
         ro for ro in open_ros if ro.ro_number not in done and _warranty_relevant(ro)
