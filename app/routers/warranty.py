@@ -90,14 +90,14 @@ async def get_audit(audit_id: uuid.UUID, session: SessionDep, current: CurrentUs
 @router.post("/audit/batch")
 async def audit_batch(
     session: SessionDep, current: CurrentUserDep, background: BackgroundTasks,
-    limit: Optional[int] = None,
+    limit: Optional[int] = None, force: bool = False,
 ):
-    """Audit the store's open ROs that HAVEN'T been audited yet (capped), in the
-    BACKGROUND. Two reasons this runs async and skips done ROs: a browser can't
-    wait minutes for 25 Claude calls (it times out with 'Failed to fetch' while
-    the server keeps burning tokens), and re-auditing an already-audited RO pays
-    Claude twice for the same answer. Returns immediately with how many were
-    queued; the page refreshes to show them as they land."""
+    """Audit the store's open ROs (capped), in the BACKGROUND. Normally skips ROs
+    already audited so a click doesn't re-spend Claude on the same answer and the
+    browser never waits minutes (it would time out with 'Failed to fetch'). Pass
+    force=true to RE-AUDIT already-audited ROs too — used after new RO data is
+    pulled (fresh tech/punch/parts) so existing audits refresh with it. Returns
+    immediately with how many were queued; the page refreshes as they land."""
     if not settings.anthropic_configured:
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
@@ -105,8 +105,9 @@ async def audit_batch(
         )
     cap = min(limit or settings.warranty_batch_cap, settings.warranty_batch_cap)
 
-    # ROs already audited for this store — skip them so a click doesn't re-spend.
-    done = set(
+    # ROs already audited for this store — skip them so a click doesn't re-spend,
+    # UNLESS force=true (re-audit to pick up freshly-pulled data).
+    done = set() if force else set(
         (
             await session.execute(
                 select(WarrantyROAudit.ro_number).where(
@@ -141,12 +142,14 @@ async def audit_batch(
     if not batch:
         return {
             "queued": 0,
-            "message": "All open ROs are already audited — nothing new to run.",
+            "message": "No warranty ROs to audit right now — all caught up.",
         }
 
     background.add_task(run_batch_audit, current.dealer_id, [ro.id for ro in batch])
     remaining = max(0, len(pending) - len(batch))
-    msg = f"Auditing {len(batch)} new RO(s) in the background — this page will update as results land."
+    verb = "Re-auditing" if force else "Auditing"
+    what = "RO(s)" if force else "new RO(s)"
+    msg = f"{verb} {len(batch)} {what} in the background — this page will update as results land."
     if remaining:
         msg += f" ({remaining} more will need another run.)"
     return {"queued": len(batch), "remaining": remaining, "message": msg}
