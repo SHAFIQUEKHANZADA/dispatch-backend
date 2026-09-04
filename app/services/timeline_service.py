@@ -140,10 +140,16 @@ async def build_timeline(
     # window: 7a–7p by default, widened to cover any shift
     view_start, view_end = 7 * 60, 19 * 60
 
+    # Only ACTIVE technicians belong on the dispatch board — inactive/off-roster
+    # techs (e.g. leftover demo rows) must not appear, or they float to the top of
+    # the attention-sorted board as permanent idle rows.
     techs = list(
         (
             await session.execute(
-                select(Technician).where(Technician.dealer_id == dealer_id)
+                select(Technician).where(
+                    Technician.dealer_id == dealer_id,
+                    Technician.active.is_(True),
+                )
             )
         ).scalars()
     )
