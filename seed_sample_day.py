@@ -62,8 +62,9 @@ def _profile(idx: int) -> tuple[float, bool, int]:
 RECIPES = [
     "CCPQ", "CPQ", "CCP", "PQ", "CPQ", "CCPQ", "CP", "CCQ", "PQQ", "CCP", "CPQ", "CCPP",
 ]
-# Leave this many free on-shift techs unseeded -> they render as IDLE (red).
-LEAVE_IDLE = 6
+# Leave this many on-shift techs unseeded -> a couple of red IDLE rows (the money
+# signal) while the rest of the board reads as a busy, working shop.
+LEAVE_IDLE = 2
 
 
 async def clear(db) -> int:
@@ -118,19 +119,23 @@ async def main(do_clear: bool) -> None:
             and t.shift_start and t.shift_end
         ]
 
-        # techs that already have a job today -> leave them alone (additive)
-        busy = set(
-            (
-                await db.execute(
-                    select(Assignment.technician_id).where(
-                        Assignment.dealer_id == ST_CHARLES,
-                        Assignment.assigned_at >= day_start,
-                        Assignment.assigned_at < day_end,
-                    )
+        # Clean slate for the demo day: remove ANY existing assignment on this day
+        # for on-shift techs (stale/idle leftovers otherwise float to the top of
+        # the "sorted by attention" board and make a busy shop look empty). We then
+        # give every on-shift tech a fresh full day below.
+        onshift_ids = [t.id for t in on_shift]
+        if onshift_ids:
+            wiped = await db.execute(
+                delete(Assignment).where(
+                    Assignment.dealer_id == ST_CHARLES,
+                    Assignment.assigned_at >= day_start,
+                    Assignment.assigned_at < day_end,
+                    Assignment.technician_id.in_(onshift_ids),
                 )
-            ).scalars()
-        )
-        free_techs = [t for t in on_shift if t.id not in busy]
+            )
+            if wiped.rowcount:
+                print(f"(cleared {wiped.rowcount} existing demo-day rows for a clean board)")
+        free_techs = on_shift
 
         ros = list(
             (
@@ -151,42 +156,43 @@ async def main(do_clear: bool) -> None:
         made = 0
         colored = {"C": 0, "P": 0, "Q": 0}
         seeded_techs: set = set()
-        # Build a per-tech job plan across the LIMITED ready pool so the board
-        # reads as a busy, colorful shop with only a few red idle rows.
-        #  Pass 1: give (almost) every tech ONE non-idle job. A lone *completed*
-        #          job would read as idle, so pass 1 uses in-progress / queued.
-        #  Pass 2: spend the remaining ROs adding blue (completed) + green depth
-        #          to the earlier techs, so we get a full color mix.
-        to_seed = free_techs[: max(0, len(free_techs) - LEAVE_IDLE)]
-        plans: dict[uuid.UUID, list[str]] = {t.id: [] for t in to_seed}
 
-        pool = len(ros)
-        p1 = ["P", "Q", "Q", "P"]  # rotate: some working-now, some queued
-        for i, t in enumerate(to_seed):
-            if pool <= 0:
-                break
-            plans[t.id].append(p1[i % len(p1)])
-            pool -= 1
-        # pass 2 — depth: completed (blue) then extra in-progress, round-robin
-        p2 = ["C", "C", "P", "C"]
-        j = 0
-        while pool > 0 and to_seed:
-            t = to_seed[j % len(to_seed)]
-            if len(plans[t.id]) < 4:  # cap a day at 4 jobs
-                plans[t.id].append(p2[(j // len(to_seed)) % len(p2)])
-                pool -= 1
-            j += 1
-            if j > len(to_seed) * 6:
-                break
+        # Give EVERY on-shift tech a full, working day so the board reads busy
+        # (leave a couple idle for the red money-signal). RO budget: completed
+        # blocks show HOURS (not an RO#), so they can safely reuse the pool; the
+        # in-progress / queued blocks show the RO#, so those take DISTINCT ROs.
+        to_seed = free_techs[: max(0, len(free_techs) - LEAVE_IDLE)]
+        n_ros = len(ros) or 1
+        _di = 0
+
+        def take_distinct():
+            nonlocal _di
+            r = ros[_di] if _di < len(ros) else None
+            _di += 1
+            return r
+
+        # each tech's day: a few completed (blue), one in-progress (green, running
+        # now), and — for a rotating subset — a queued-next (light-green). Sorted
+        # C -> P -> Q so the day tiles naturally from shift start.
+        def plan_for(i: int) -> list[str]:
+            n_completed = 2 if i % 5 == 0 else 3
+            plan = ["C"] * n_completed + ["P"]
+            if i % 2 == 0:
+                plan.append("Q")
+            return plan
 
         for ti, tech in enumerate(to_seed):
             skill, wants_comeback, match_base = _profile(ti)   # this tech's report profile
             comeback_used = False
-            # order jobs completed -> in-progress -> queued for a natural day
-            jobs = sorted(plans[tech.id], key=lambda c: {"C": 0, "P": 1, "Q": 2}[c])
+            jobs = plan_for(ti)   # already C…, P, Q order
             offset = 0.0
+            reuse_k = 0
             for job in jobs:
-                ro = next_ro()
+                if job == "C":
+                    ro = ros[(ti * 4 + reuse_k) % n_ros]   # reuse ok (hours label)
+                    reuse_k += 1
+                else:
+                    ro = take_distinct() or ros[(ti + reuse_k) % n_ros]  # distinct RO#
                 if ro is None:
                     break
                 # completed jobs feed the Reports (efficiency = guide/actual), so
