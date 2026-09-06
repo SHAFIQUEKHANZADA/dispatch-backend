@@ -4,3 +4,5 @@ __pycache__/
 .env
 dispatch.db
 .pytest_cache/
+# per-store GHL credentials (private integration tokens, webhook secrets)
+ghl_credentials.json

@@ -8,6 +8,8 @@ updated in place. Run from backend/:  python provision_ghl.py
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
 from pathlib import Path
 
 from sqlalchemy import select, text
@@ -15,37 +17,24 @@ from sqlalchemy import select, text
 from app.db import SessionLocal, engine
 from app.models import Dealer, GHLDealer
 
-# dealer_key -> (api_key, location_id, object_key, object_id, webhook_secret)
-STORES = {
-    "mcgrath_honda_stcharles": (
-        "REDACTED-ROTATED-TOKEN",
-        "HU18sX5xyiO7gIs3Bwyx",
-        "custom_objects.warranty_ro_audits",
-        "6a91a7d22414af40a33d5dda",
-        "wh_mcgrath_stc_1636ab5a",
-    ),
-    "mcgrath_honda_elgin": (
-        "REDACTED-ROTATED-TOKEN",
-        "tj3HUTFhDGeHiw2B8HG8",
-        "custom_objects.warranty_ro_audits",
-        "6a91a6bb3e5704f21003f3fa",
-        "wh_mcgrath_elg_7cdac63d",
-    ),
-    "mcgrath_acura_libertyville": (
-        "REDACTED-ROTATED-TOKEN",
-        "1Q3CnW3bXdJB6R8Iicm4",
-        "custom_objects.warranty_ro_audits",
-        "6a91a7f4590a4ebe7fa3c315",
-        "wh_mcgrath_lib_39a1a06d",
-    ),
-    "mcgrath_acura_mortongrove": (
-        "REDACTED-ROTATED-TOKEN",
-        "xmT0rEWnHedqfBzpaXsb",
-        "custom_objects.warranty_ro_audits",
-        "6a8f277866d3883b0e1882ea",
-        "wh_mcgrath_9f3k2p7q",
-    ),
-}
+# Per-store GHL credentials live in an untracked file (never commit secrets).
+# Copy ghl_credentials.example.json -> ghl_credentials.json and fill it in.
+CREDENTIALS = Path(__file__).resolve().parent / "ghl_credentials.json"
+
+
+def load_stores() -> dict[str, dict]:
+    if not CREDENTIALS.exists():
+        sys.exit(
+            f"missing {CREDENTIALS.name} — copy ghl_credentials.example.json to it "
+            "and fill in the real per-store values (see README/security notes)."
+        )
+    data = json.loads(CREDENTIALS.read_text(encoding="utf-8"))
+    stores = {k: v for k, v in data.items() if not k.startswith("_")}
+    for key, cfg in stores.items():
+        if str(cfg.get("api_key", "")).startswith("pit-REPLACE"):
+            sys.exit(f"{key}: api_key is still a placeholder — paste the rotated token first.")
+    return stores
+
 
 MIGRATION = Path(__file__).resolve().parents[1] / "supabase" / "migrations" / "0007_ghl_dealers.sql"
 
@@ -64,8 +53,14 @@ async def main() -> None:
     print(f"migration applied: {MIGRATION.name}")
 
     # 2) upsert one row per store
+    stores = load_stores()
     async with SessionLocal() as session:
-        for key, (api_key, loc, okey, oid, secret) in STORES.items():
+        for key, cfg in stores.items():
+            api_key = cfg["api_key"]
+            loc = cfg["location_id"]
+            okey = cfg["object_key"]
+            oid = cfg["object_id"]
+            secret = cfg["webhook_secret"]
             dealer = (
                 await session.execute(select(Dealer).where(Dealer.dealer_key == key))
             ).scalar_one_or_none()
