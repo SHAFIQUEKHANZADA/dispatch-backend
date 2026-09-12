@@ -92,6 +92,84 @@ def is_call(c: dict) -> bool:
     )
 
 
+def fetch_contacts(location_id: str, token: str, since_ms: int) -> list[dict]:
+    """Contacts CREATED since `since_ms` — this matches how GHL's own dashboard
+    counts (records by dateAdded + tags), so our numbers reconcile with theirs.
+    Each contact Esther handled carries the AI workflow's tags."""
+    H = {
+        "Authorization": f"Bearer {token}", "Version": "2021-07-28",
+        "Accept": "application/json", "Content-Type": "application/json",
+    }
+    out: list[dict] = []
+    search_after = None
+    with httpx.Client(timeout=30) as client:
+        while True:
+            body: dict = {
+                "locationId": location_id,
+                "pageLimit": 100,
+                "filters": [{"field": "dateAdded", "operator": "range", "value": {"gte": since_ms}}],
+                "sort": [{"field": "dateAdded", "direction": "desc"}],
+            }
+            if search_after:
+                body["searchAfter"] = search_after
+            r = client.post(f"{GHL_BASE}/contacts/search", headers=H, json=body)
+            if r.status_code != 200:
+                break
+            cs = r.json().get("contacts") or []
+            if not cs:
+                break
+            out.extend(cs)
+            search_after = cs[-1].get("searchAfter")
+            if len(cs) < 100 or not search_after:
+                break
+    return out
+
+
+def _parse_dt(v) -> datetime:
+    if isinstance(v, (int, float)):
+        return datetime.fromtimestamp(v / 1000, tz=timezone.utc)
+    return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+
+
+def derive_from_contact(c: dict, tz: ZoneInfo) -> dict:
+    tags = [str(t).lower() for t in (c.get("tags") or [])]
+    tagset = set(tags)
+    dept = "service" if "dept-service" in tagset else ("sales" if "dept-sales" in tagset else None)
+    transferred = bool(tagset & TRANSFER_TAGS)
+    callback = "callback-needed" in tagset
+    if tagset & BOOKED_TAGS:
+        outcome = "booked"
+    elif "dropped" in tagset:
+        outcome = "dropped"
+    elif callback:
+        outcome = "callback_needed"
+    elif "info-only" in tagset:
+        outcome = "info_only"
+    elif "no-transcript" in tagset:
+        outcome = "no_transcript"
+    else:
+        outcome = None
+    intent = next((t[len("topic-"):] for t in tags if t.startswith("topic-")), None)
+    started = _parse_dt(c.get("dateAdded"))
+    ld = started.astimezone(tz).date()
+    return {
+        "ghl_conversation_id": None,
+        "ghl_contact_id": c.get("id"),
+        "ghl_message_id": c.get("id"),  # one row per contact
+        "started_at": started,
+        "local_date": ld,
+        "direction": "inbound",
+        "department": dept,
+        "outcome": outcome,
+        "intent": intent,
+        "transferred": transferred,
+        "transfer_succeeded": None,
+        "callback_needed": callback,
+        "needs_attention": "needs-attention" in tagset,
+        "tags": tags,
+    }
+
+
 def derive_call(c: dict, tz: ZoneInfo) -> dict:
     tags = [str(t).lower() for t in (c.get("tags") or [])]
     tagset = set(tags)
@@ -142,27 +220,34 @@ async def sync_calls(pg, store: dict, since_ms: int, tokens: dict[str, str]) -> 
     if not loc or not token:
         return 0
     tz = ZoneInfo(store["timezone"] or "America/Chicago")
-    convs = [c for c in fetch_call_conversations(loc, token, since_ms) if is_call(c)]
-    rows = [derive_call(c, tz) for c in convs]
-    for r in rows:
-        await pg.execute(
-            """
-            insert into esther_calls
-              (store_id, ghl_conversation_id, ghl_contact_id, ghl_message_id, started_at,
-               local_date, direction, department, outcome, intent, transferred,
-               transfer_succeeded, callback_needed, needs_attention, tags)
-            values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-            on conflict (ghl_message_id) do update set
-               outcome=excluded.outcome, intent=excluded.intent, department=excluded.department,
-               transferred=excluded.transferred, transfer_succeeded=excluded.transfer_succeeded,
-               callback_needed=excluded.callback_needed, needs_attention=excluded.needs_attention,
-               tags=excluded.tags, started_at=excluded.started_at
-            """,
+    contacts = fetch_contacts(loc, token, since_ms)
+    rows = [derive_from_contact(c, tz) for c in contacts]
+    if not rows:
+        return 0
+    params = [
+        (
             store["id"], r["ghl_conversation_id"], r["ghl_contact_id"], r["ghl_message_id"],
             r["started_at"], r["local_date"], r["direction"], r["department"], r["outcome"],
             r["intent"], r["transferred"], r["transfer_succeeded"], r["callback_needed"],
             r["needs_attention"], r["tags"],
         )
+        for r in rows
+    ]
+    await pg.executemany(
+        """
+        insert into esther_calls
+          (store_id, ghl_conversation_id, ghl_contact_id, ghl_message_id, started_at,
+           local_date, direction, department, outcome, intent, transferred,
+           transfer_succeeded, callback_needed, needs_attention, tags)
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        on conflict (ghl_message_id) do update set
+           outcome=excluded.outcome, intent=excluded.intent, department=excluded.department,
+           transferred=excluded.transferred, transfer_succeeded=excluded.transfer_succeeded,
+           callback_needed=excluded.callback_needed, needs_attention=excluded.needs_attention,
+           tags=excluded.tags, started_at=excluded.started_at
+        """,
+        params,
+    )
     return len(rows)
 
 
@@ -203,13 +288,19 @@ async def sync_appointments(pg, session_factory, store: dict, day_lo, day_hi, tz
     scan_lo = day_lo
     scan_hi = day_hi + timedelta(days=45)
     days = [(scan_lo + timedelta(n)).isoformat() for n in range((scan_hi - scan_lo).days + 1)]
-    count = 0
-    for d in days:
+
+    def fetch(d: str):
         try:
-            appts = client.get_appointments(d).get("serviceAppointments") or []
+            return client.get_appointments(d).get("serviceAppointments") or []
         except MyKaarmaError:
-            continue
-        for a in appts:
+            return []
+
+    # fetch all service-days concurrently (was the slow part)
+    per_day = await asyncio.gather(*[asyncio.to_thread(fetch, d) for d in days])
+    params = []
+    seen = set()
+    for day in per_day:
+        for a in day:
             m = _map_appointment(a)
             booked_raw = m.get("booked_at")
             start_raw = m.get("start_time")
@@ -232,22 +323,30 @@ async def sync_appointments(pg, session_factory, store: dict, day_lo, day_hi, tz
             local_date = basis.astimezone(tz).date()
             if not (day_lo <= local_date <= day_hi):
                 continue
-            await pg.execute(
-                """
-                insert into esther_appointments
-                  (store_id, mykaarma_appointment_uuid, customer_name, vehicle, service,
-                   start_time, local_date, source)
-                values ($1,$2,$3,$4,$5,$6,$7,$8)
-                on conflict (mykaarma_appointment_uuid) do update set
-                   local_date=excluded.local_date, source=excluded.source,
-                   start_time=excluded.start_time, customer_name=excluded.customer_name
-                """,
-                store["id"], m.get("appointment_uuid"), m.get("customer_name"),
+            appt_uuid = m.get("appointment_uuid")
+            if not appt_uuid or appt_uuid in seen:
+                continue  # de-dupe (same appointment can surface across scanned days)
+            seen.add(appt_uuid)
+            params.append((
+                store["id"], appt_uuid, m.get("customer_name"),
                 m.get("vehicle"), m.get("service_requested"),
                 start_dt or basis, local_date, map_source(m.get("source")),
-            )
-            count += 1
-    return count
+            ))
+    if not params:
+        return 0
+    await pg.executemany(
+        """
+        insert into esther_appointments
+          (store_id, mykaarma_appointment_uuid, customer_name, vehicle, service,
+           start_time, local_date, source)
+        values ($1,$2,$3,$4,$5,$6,$7,$8)
+        on conflict (mykaarma_appointment_uuid) do update set
+           local_date=excluded.local_date, source=excluded.source,
+           start_time=excluded.start_time, customer_name=excluded.customer_name
+        """,
+        params,
+    )
+    return len(params)
 
 
 # ── Rollup ────────────────────────────────────────────────
@@ -259,18 +358,27 @@ async def rollup(pg, store_id, date: str) -> None:
         ), a as (
           select * from esther_appointments where store_id=$1 and local_date=$2
         ), intent as (
-          select coalesce(intent,'other') k, count(*) n from c where intent is not null group by 1
+          -- count EVERY call; calls with no topic tag go to 'uncategorized' so the
+          -- Customer Intent donut totals to total_calls (no silently-dropped calls).
+          select coalesce(nullif(trim(intent),''),'uncategorized') k, count(*) n from c group by 1
+        ), sp as (
+          -- real AI spend for the day, from the GHL billing export (esther_ai_spend).
+          -- null when nothing imported yet, so the card shows "Awaiting data", never $0.
+          select sum(amount_usd) spend from esther_ai_spend
+          where store_id=$1 and local_date=$2
+            and source in ('voice_ai','workflow_ai','reviews_ai','conversation_ai','content_ai')
         )
         insert into esther_daily_metrics as dm
           (store_id, local_date, total_calls, appointments_booked, eligible_calls, booking_pct,
-           transfers, failed_transfers, dropped_calls, callbacks_needed, intent_breakdown, updated_at)
+           transfers, failed_transfers, dropped_calls, callbacks_needed, intent_breakdown,
+           ai_spend, cost_per_booking, updated_at)
         select
           $1, $2,
           (select count(*) from c),
-          (select count(*) from a where source='ai'),
+          (select count(*) from c where outcome='booked'),
           (select count(*) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'),
           case when (select count(*) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript') > 0
-               then round(100.0 * (select count(*) from a where source='ai')
+               then round(100.0 * (select count(*) from c where outcome='booked')
                     / (select count(*) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'), 2)
                else null end,
           (select count(*) from c where transferred),
@@ -278,13 +386,18 @@ async def rollup(pg, store_id, date: str) -> None:
           (select count(*) from c where outcome='dropped'),
           (select count(*) from c where callback_needed),
           coalesce((select jsonb_object_agg(k, n) from intent), '{}'::jsonb),
+          (select spend from sp),
+          case when (select spend from sp) is not null and (select count(*) from c where outcome='booked') > 0
+               then round((select spend from sp) / (select count(*) from c where outcome='booked'), 2)
+               else null end,
           now()
         on conflict (store_id, local_date) do update set
           total_calls=excluded.total_calls, appointments_booked=excluded.appointments_booked,
           eligible_calls=excluded.eligible_calls, booking_pct=excluded.booking_pct,
           transfers=excluded.transfers, failed_transfers=excluded.failed_transfers,
           dropped_calls=excluded.dropped_calls, callbacks_needed=excluded.callbacks_needed,
-          intent_breakdown=excluded.intent_breakdown, updated_at=now()
+          intent_breakdown=excluded.intent_breakdown,
+          ai_spend=excluded.ai_spend, cost_per_booking=excluded.cost_per_booking, updated_at=now()
         """,
         store_id, date,
     )
@@ -300,22 +413,27 @@ async def run_ingest(days: int, log=print) -> list[dict]:
     since_ms = int(datetime(day_lo.year, day_lo.month, day_lo.day, tzinfo=tz_default).timestamp() * 1000)
 
     summary: list[dict] = []
+    # read the store list first (own txn)
     async with engine.begin() as conn:
-        raw = await conn.get_raw_connection()
-        pg = raw.driver_connection
-        stores = await pg.fetch(
-            "select id, key, name, ghl_location_id, mykaarma_dealer_key, timezone "
-            "from esther_stores where active order by sort_order"
-        )
-        for s in stores:
-            store = dict(s)
-            tz = ZoneInfo(store["timezone"] or "America/Chicago")
+        pg = (await conn.get_raw_connection()).driver_connection
+        stores = [
+            dict(s)
+            for s in await pg.fetch(
+                "select id, key, name, ghl_location_id, mykaarma_dealer_key, timezone "
+                "from esther_stores where active order by sort_order"
+            )
+        ]
+    # each store commits in its OWN txn, so its data appears as soon as it's done
+    for store in stores:
+        tz = ZoneInfo(store["timezone"] or "America/Chicago")
+        async with engine.begin() as conn:
+            pg = (await conn.get_raw_connection()).driver_connection
             nc = await sync_calls(pg, store, since_ms, tokens)
             na = await sync_appointments(pg, None, store, day_lo, today, tz)
             for n in range(days):
                 await rollup(pg, store["id"], day_lo + timedelta(n))
-            summary.append({"store": store["name"], "calls": nc, "appointments": na})
-            log(f"{store['name']:<32} calls={nc:<5} appts={na:<5} (rolled {days} days)")
+        summary.append({"store": store["name"], "calls": nc, "appointments": na})
+        log(f"{store['name']:<32} calls={nc:<5} appts={na:<5} (rolled {days} days)")
     return summary
 
 
