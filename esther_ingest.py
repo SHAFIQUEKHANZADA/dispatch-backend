@@ -370,8 +370,8 @@ async def rollup(pg, store_id, date: str) -> None:
         )
         insert into esther_daily_metrics as dm
           (store_id, local_date, total_calls, appointments_booked, eligible_calls, booking_pct,
-           transfers, failed_transfers, dropped_calls, callbacks_needed, intent_breakdown,
-           ai_spend, cost_per_booking, updated_at)
+           transfers, failed_transfers, dropped_calls, callbacks_needed, recovered_count,
+           intent_breakdown, ai_spend, cost_per_booking, updated_at)
         select
           $1, $2,
           (select count(*) from c),
@@ -385,6 +385,10 @@ async def rollup(pg, store_id, date: str) -> None:
           (select count(*) from c where transferred and transfer_succeeded is false),
           (select count(*) from c where outcome='dropped'),
           (select count(*) from c where callback_needed),
+          -- recovered: an at-risk contact (dropped / callback-needed / needs-attention)
+          -- that ultimately booked. Detected from the tags we already store.
+          (select count(*) from c where outcome='booked'
+             and tags && array['dropped','callback-needed','needs-attention']),
           coalesce((select jsonb_object_agg(k, n) from intent), '{}'::jsonb),
           (select spend from sp),
           case when (select spend from sp) is not null and (select count(*) from c where outcome='booked') > 0
@@ -396,8 +400,30 @@ async def rollup(pg, store_id, date: str) -> None:
           eligible_calls=excluded.eligible_calls, booking_pct=excluded.booking_pct,
           transfers=excluded.transfers, failed_transfers=excluded.failed_transfers,
           dropped_calls=excluded.dropped_calls, callbacks_needed=excluded.callbacks_needed,
+          recovered_count=excluded.recovered_count,
           intent_breakdown=excluded.intent_breakdown,
           ai_spend=excluded.ai_spend, cost_per_booking=excluded.cost_per_booking, updated_at=now()
+        """,
+        store_id, date,
+    )
+
+
+async def sync_recovered(pg, store_id, date) -> None:
+    """Repopulate the recovered-opportunities drill-down for one store-day:
+    contacts that were at risk (dropped / callback-needed / needs-attention) yet
+    ultimately booked. Rebuilt each run so it stays in sync with the tags."""
+    await pg.execute(
+        "delete from esther_recovered_opportunities where store_id=$1 and local_date=$2",
+        store_id, date,
+    )
+    await pg.execute(
+        """
+        insert into esther_recovered_opportunities
+          (store_id, local_date, original_call_id, recovery_call_id, intent, outcome, value, recovered_at)
+        select store_id, local_date, id, id, intent, 'Booked', null, started_at
+        from esther_calls
+        where store_id=$1 and local_date=$2 and outcome='booked'
+          and tags && array['dropped','callback-needed','needs-attention']
         """,
         store_id, date,
     )
@@ -431,7 +457,9 @@ async def run_ingest(days: int, log=print) -> list[dict]:
             nc = await sync_calls(pg, store, since_ms, tokens)
             na = await sync_appointments(pg, None, store, day_lo, today, tz)
             for n in range(days):
-                await rollup(pg, store["id"], day_lo + timedelta(n))
+                d = day_lo + timedelta(n)
+                await rollup(pg, store["id"], d)
+                await sync_recovered(pg, store["id"], d)
         summary.append({"store": store["name"], "calls": nc, "appointments": na})
         log(f"{store['name']:<32} calls={nc:<5} appts={na:<5} (rolled {days} days)")
     return summary
