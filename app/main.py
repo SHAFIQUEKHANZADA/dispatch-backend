@@ -14,6 +14,7 @@ from .routers import (
     dealer,
     dev,
     dispatch,
+    esther,
     imports,
     loaners,
     mykaarma,
@@ -87,6 +88,7 @@ for r in (
     route_sheet.router,
     stores.router,
     warranty.router,
+    esther.router,
     dev.router,
 ):
     app.include_router(r, prefix=settings.api_prefix)

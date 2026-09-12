@@ -1,0 +1,329 @@
+"""Esther dashboard ingestion — pulls REAL data into the esther_* tables.
+
+Sources (both proven working):
+  * GHL conversations + AI workflow tags  -> esther_calls
+  * myKaarma appointments (via connector) -> esther_appointments
+Then rolls both up into esther_daily_metrics (what the dashboard reads).
+
+Writes go straight to the shared Supabase Postgres (same DB the dispatch app
+uses) via the backend engine, so it bypasses RLS as the DB owner. GHL tokens are
+read from ai_dashboard/.env.local (gitignored) — never hardcoded here.
+
+Run:  python esther_ingest.py [days]        # default 14
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import httpx
+
+from app.db import engine
+from app.mykaarma.connector import resolve_creds, _map_appointment
+from app.mykaarma.client import MyKaarmaClient, MyKaarmaError
+
+GHL_BASE = "https://services.leadconnectorhq.com"
+ENV_PATH = Path(__file__).resolve().parents[1] / "ai_dashboard" / ".env.local"
+
+BOOKED_TAGS = {"service-booked", "sales-booked", "call-booked-ai"}
+TRANSFER_TAGS = {"transferred", "call-transferred"}
+FAILED_CALL_STATUS = {"no-answer", "busy", "failed", "voicemail", "canceled", "cancelled"}
+
+
+def load_ghl_tokens() -> dict[str, str]:
+    """GHL per-store tokens, keyed by store key. Prefers env vars (production /
+    Railway) and falls back to ai_dashboard/.env.local for local dev."""
+    import os
+    tokens: dict[str, str] = {}
+    for k, v in os.environ.items():
+        if k.startswith("GHL_TOKEN__") and v:
+            tokens[k.replace("GHL_TOKEN__", "").strip()] = v.strip()
+    if not tokens and ENV_PATH.exists():
+        for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if s.startswith("GHL_TOKEN__") and "=" in s:
+                k, v = s.split("=", 1)
+                tokens[k.replace("GHL_TOKEN__", "").strip()] = v.strip()
+    return tokens
+
+
+# ── GHL calls ─────────────────────────────────────────────
+def fetch_call_conversations(location_id: str, token: str, since_ms: int) -> list[dict]:
+    """Page conversations newest->oldest until older than `since_ms`."""
+    H = {"Authorization": f"Bearer {token}", "Version": "2021-04-15", "Accept": "application/json"}
+    out: list[dict] = []
+    cursor: int | None = None
+    with httpx.Client(timeout=30) as client:
+        while True:
+            params = {"locationId": location_id, "limit": 100, "sortBy": "last_message_date", "sort": "desc"}
+            if cursor:
+                params["startAfterDate"] = cursor
+            r = client.get(f"{GHL_BASE}/conversations/search", params=params, headers=H)
+            if r.status_code != 200:
+                break
+            cs = r.json().get("conversations") or []
+            if not cs:
+                break
+            reached_end = False
+            for c in cs:
+                lmd = c.get("lastMessageDate")
+                if not lmd:
+                    continue
+                if lmd < since_ms:
+                    reached_end = True
+                    continue
+                out.append(c)
+            cursor = cs[-1].get("lastMessageDate")
+            if reached_end or len(cs) < 100 or not cursor:
+                break
+    return out
+
+
+def is_call(c: dict) -> bool:
+    return (
+        c.get("type") == "TYPE_PHONE"
+        or c.get("lastMessageType") == "TYPE_CALL"
+        or "TYPE_CALL" in (c.get("messageTypes") or [])
+    )
+
+
+def derive_call(c: dict, tz: ZoneInfo) -> dict:
+    tags = [str(t).lower() for t in (c.get("tags") or [])]
+    tagset = set(tags)
+    dept = "service" if "dept-service" in tagset else ("sales" if "dept-sales" in tagset else None)
+    transferred = bool(tagset & TRANSFER_TAGS)
+    callback = "callback-needed" in tagset
+    if tagset & BOOKED_TAGS:
+        outcome = "booked"
+    elif "dropped" in tagset:
+        outcome = "dropped"
+    elif callback:
+        outcome = "callback_needed"
+    elif "info-only" in tagset:
+        outcome = "info_only"
+    elif "no-transcript" in tagset:
+        outcome = "no_transcript"
+    else:
+        outcome = None
+    intent = next((t[len("topic-"):] for t in tags if t.startswith("topic-")), None)
+    call_status = str(c.get("lastCallStatus") or "").lower()
+    transfer_succeeded = None
+    if transferred:
+        transfer_succeeded = call_status not in FAILED_CALL_STATUS if call_status else None
+    ms = c.get("lastMessageDate")
+    started = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    ld = started.astimezone(tz).date()
+    return {
+        "ghl_conversation_id": c.get("id"),
+        "ghl_contact_id": c.get("contactId"),
+        "ghl_message_id": f"{c.get('id')}:{ld.isoformat()}",
+        "started_at": started,
+        "local_date": ld,
+        "direction": (c.get("lastMessageDirection") or None),
+        "department": dept,
+        "outcome": outcome,
+        "intent": intent,
+        "transferred": transferred,
+        "transfer_succeeded": transfer_succeeded,
+        "callback_needed": callback,
+        "needs_attention": "needs-attention" in tagset,
+        "tags": tags,
+    }
+
+
+async def sync_calls(pg, store: dict, since_ms: int, tokens: dict[str, str]) -> int:
+    loc = store["ghl_location_id"]
+    token = tokens.get(store["key"])
+    if not loc or not token:
+        return 0
+    tz = ZoneInfo(store["timezone"] or "America/Chicago")
+    convs = [c for c in fetch_call_conversations(loc, token, since_ms) if is_call(c)]
+    rows = [derive_call(c, tz) for c in convs]
+    for r in rows:
+        await pg.execute(
+            """
+            insert into esther_calls
+              (store_id, ghl_conversation_id, ghl_contact_id, ghl_message_id, started_at,
+               local_date, direction, department, outcome, intent, transferred,
+               transfer_succeeded, callback_needed, needs_attention, tags)
+            values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            on conflict (ghl_message_id) do update set
+               outcome=excluded.outcome, intent=excluded.intent, department=excluded.department,
+               transferred=excluded.transferred, transfer_succeeded=excluded.transfer_succeeded,
+               callback_needed=excluded.callback_needed, needs_attention=excluded.needs_attention,
+               tags=excluded.tags, started_at=excluded.started_at
+            """,
+            store["id"], r["ghl_conversation_id"], r["ghl_contact_id"], r["ghl_message_id"],
+            r["started_at"], r["local_date"], r["direction"], r["department"], r["outcome"],
+            r["intent"], r["transferred"], r["transfer_succeeded"], r["callback_needed"],
+            r["needs_attention"], r["tags"],
+        )
+    return len(rows)
+
+
+# ── myKaarma appointments ─────────────────────────────────
+SOURCE_MAP = {"Appointment API": "ai", "DMS": "dms", "Online Scheduler": "online"}
+
+
+def map_source(raw: str | None) -> str:
+    return SOURCE_MAP.get(raw or "", "online")
+
+
+async def dispatch_dealer_id(pg, dealer_key: str) -> uuid.UUID | None:
+    row = await pg.fetchrow("select id from dealers where dealer_key=$1", dealer_key)
+    return row["id"] if row else None
+
+
+async def sync_appointments(pg, session_factory, store: dict, day_lo, day_hi, tz: ZoneInfo) -> int:
+    """Pull appointments whose SERVICE date is in [day_lo, day_hi+45d]; store each,
+    dating the row by its BOOKING date (when Esther booked it)."""
+    from app.db import SessionLocal
+    dealer_key = store["mykaarma_dealer_key"]
+    if not dealer_key:
+        return 0
+    async with SessionLocal() as session:
+        did = await dispatch_dealer_id(pg, dealer_key)
+        if did is None:
+            return 0
+        creds = await resolve_creds(session, did)
+        if creds is None:
+            return 0
+    client = MyKaarmaClient(creds)
+    try:
+        if not client.probe_appointment_scope():
+            return 0
+    except Exception:
+        return 0
+    # scan service days (booking date <= service date), a bit before and well after
+    scan_lo = day_lo
+    scan_hi = day_hi + timedelta(days=45)
+    days = [(scan_lo + timedelta(n)).isoformat() for n in range((scan_hi - scan_lo).days + 1)]
+    count = 0
+    for d in days:
+        try:
+            appts = client.get_appointments(d).get("serviceAppointments") or []
+        except MyKaarmaError:
+            continue
+        for a in appts:
+            m = _map_appointment(a)
+            booked_raw = m.get("booked_at")
+            start_raw = m.get("start_time")
+            try:
+                booked_dt = datetime.fromisoformat((booked_raw or "").replace(" ", "T"))
+                if booked_dt.tzinfo is None:
+                    booked_dt = booked_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                booked_dt = None
+            try:
+                start_dt = datetime.fromisoformat((start_raw or "").replace(" ", "T"))
+                if start_dt.tzinfo is None:
+                    start_dt = start_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                start_dt = None
+            # date the row by BOOKING day (Esther booked it that day)
+            basis = booked_dt or start_dt
+            if basis is None:
+                continue
+            local_date = basis.astimezone(tz).date()
+            if not (day_lo <= local_date <= day_hi):
+                continue
+            await pg.execute(
+                """
+                insert into esther_appointments
+                  (store_id, mykaarma_appointment_uuid, customer_name, vehicle, service,
+                   start_time, local_date, source)
+                values ($1,$2,$3,$4,$5,$6,$7,$8)
+                on conflict (mykaarma_appointment_uuid) do update set
+                   local_date=excluded.local_date, source=excluded.source,
+                   start_time=excluded.start_time, customer_name=excluded.customer_name
+                """,
+                store["id"], m.get("appointment_uuid"), m.get("customer_name"),
+                m.get("vehicle"), m.get("service_requested"),
+                start_dt or basis, local_date, map_source(m.get("source")),
+            )
+            count += 1
+    return count
+
+
+# ── Rollup ────────────────────────────────────────────────
+async def rollup(pg, store_id, date: str) -> None:
+    await pg.execute(
+        """
+        with c as (
+          select * from esther_calls where store_id=$1 and local_date=$2
+        ), a as (
+          select * from esther_appointments where store_id=$1 and local_date=$2
+        ), intent as (
+          select coalesce(intent,'other') k, count(*) n from c where intent is not null group by 1
+        )
+        insert into esther_daily_metrics as dm
+          (store_id, local_date, total_calls, appointments_booked, eligible_calls, booking_pct,
+           transfers, failed_transfers, dropped_calls, callbacks_needed, intent_breakdown, updated_at)
+        select
+          $1, $2,
+          (select count(*) from c),
+          (select count(*) from a where source='ai'),
+          (select count(*) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'),
+          case when (select count(*) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript') > 0
+               then round(100.0 * (select count(*) from a where source='ai')
+                    / (select count(*) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'), 2)
+               else null end,
+          (select count(*) from c where transferred),
+          (select count(*) from c where transferred and transfer_succeeded is false),
+          (select count(*) from c where outcome='dropped'),
+          (select count(*) from c where callback_needed),
+          coalesce((select jsonb_object_agg(k, n) from intent), '{}'::jsonb),
+          now()
+        on conflict (store_id, local_date) do update set
+          total_calls=excluded.total_calls, appointments_booked=excluded.appointments_booked,
+          eligible_calls=excluded.eligible_calls, booking_pct=excluded.booking_pct,
+          transfers=excluded.transfers, failed_transfers=excluded.failed_transfers,
+          dropped_calls=excluded.dropped_calls, callbacks_needed=excluded.callbacks_needed,
+          intent_breakdown=excluded.intent_breakdown, updated_at=now()
+        """,
+        store_id, date,
+    )
+
+
+async def run_ingest(days: int, log=print) -> list[dict]:
+    """Ingest the last `days` days for every active store. Returns a per-store
+    summary. Does NOT dispose the engine (safe to call from a running server)."""
+    tokens = load_ghl_tokens()
+    tz_default = ZoneInfo("America/Chicago")
+    today = datetime.now(tz_default).date()
+    day_lo = today - timedelta(days=days - 1)
+    since_ms = int(datetime(day_lo.year, day_lo.month, day_lo.day, tzinfo=tz_default).timestamp() * 1000)
+
+    summary: list[dict] = []
+    async with engine.begin() as conn:
+        raw = await conn.get_raw_connection()
+        pg = raw.driver_connection
+        stores = await pg.fetch(
+            "select id, key, name, ghl_location_id, mykaarma_dealer_key, timezone "
+            "from esther_stores where active order by sort_order"
+        )
+        for s in stores:
+            store = dict(s)
+            tz = ZoneInfo(store["timezone"] or "America/Chicago")
+            nc = await sync_calls(pg, store, since_ms, tokens)
+            na = await sync_appointments(pg, None, store, day_lo, today, tz)
+            for n in range(days):
+                await rollup(pg, store["id"], day_lo + timedelta(n))
+            summary.append({"store": store["name"], "calls": nc, "appointments": na})
+            log(f"{store['name']:<32} calls={nc:<5} appts={na:<5} (rolled {days} days)")
+    return summary
+
+
+async def main(days: int) -> None:
+    await run_ingest(days)
+    await engine.dispose()
+
+
+if __name__ == "__main__":
+    d = int(sys.argv[1]) if len(sys.argv) > 1 else 14
+    asyncio.run(main(d))

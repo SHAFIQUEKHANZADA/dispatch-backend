@@ -67,18 +67,27 @@ RECIPES = [
 LEAVE_IDLE = 2
 
 
-async def clear(db) -> int:
-    await db.execute(
-        delete(ComebackPairRow).where(
-            ComebackPairRow.dealer_id == ST_CHARLES,
-            ComebackPairRow.repeat_ro_number.like(f"{CB_PREFIX}%"),
-        )
+async def clear(db, day_start=None, day_end=None) -> int:
+    """Remove seeded rows. With a day window, clear ONLY that day so seeding one
+    day never wipes another (lets today + tomorrow both stay colored). With no
+    window (the --clear undo), remove every seeded row across all dates."""
+    cb_q = delete(ComebackPairRow).where(
+        ComebackPairRow.dealer_id == ST_CHARLES,
+        ComebackPairRow.repeat_ro_number.like(f"{CB_PREFIX}%"),
     )
-    res = await db.execute(
-        delete(Assignment).where(
-            Assignment.dealer_id == ST_CHARLES, Assignment.assigned_by == SENTINEL
-        )
+    a_q = delete(Assignment).where(
+        Assignment.dealer_id == ST_CHARLES, Assignment.assigned_by == SENTINEL
     )
+    if day_start is not None:
+        cb_q = cb_q.where(
+            ComebackPairRow.original_closed_at >= day_start,
+            ComebackPairRow.original_closed_at < day_end,
+        )
+        a_q = a_q.where(
+            Assignment.assigned_at >= day_start, Assignment.assigned_at < day_end
+        )
+    await db.execute(cb_q)
+    res = await db.execute(a_q)
     await db.commit()
     return res.rowcount or 0
 
@@ -97,12 +106,14 @@ async def main(do_clear: bool) -> None:
             await engine.dispose()
             return
 
-        removed = await clear(db)  # idempotent: clear our own prior seed first
-        if removed:
-            print(f"(re-run) cleared {removed} previously-seeded rows")
-
         day_start = datetime.combine(day, time(0, 0), tzinfo=tz).astimezone(timezone.utc)
         day_end = day_start + timedelta(days=1)
+
+        # idempotent: clear our own prior seed for THIS day only (other days keep
+        # their colors, so today and tomorrow can both be seeded).
+        removed = await clear(db, day_start, day_end)
+        if removed:
+            print(f"(re-run) cleared {removed} previously-seeded rows for {day.isoformat()}")
 
         techs = list(
             (
