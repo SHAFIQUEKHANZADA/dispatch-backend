@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -32,6 +33,25 @@ settings = get_settings()
 log = logging.getLogger("3d-dispatch")
 
 
+async def _esther_autosync_loop(minutes: int):
+    """Keep the Esther dashboard near-real-time: pull today's calls + appointments
+    every `minutes`. Runs inside the always-on backend, so no external scheduler
+    is needed. Each run is idempotent (upsert + window rebuild); failures are
+    logged and never take the web server down."""
+    from esther_ingest import run_ingest  # imported lazily; pulls in app.db etc.
+
+    await asyncio.sleep(20)  # let the web server finish booting first
+    while True:
+        try:
+            summary = await run_ingest(1, log=lambda *_: None)
+            log.info("esther autosync: ok %s", summary)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("esther autosync: run failed — will retry next cycle")
+        await asyncio.sleep(minutes * 60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if settings.auth_mode == "dev":
@@ -47,7 +67,19 @@ async def lifespan(app: FastAPI):
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
+    autosync = None
+    if settings.esther_autosync_minutes > 0 and not settings.is_sqlite:
+        log.info("esther autosync: enabled, every %s min", settings.esther_autosync_minutes)
+        autosync = asyncio.create_task(_esther_autosync_loop(settings.esther_autosync_minutes))
+
     yield
+
+    if autosync:
+        autosync.cancel()
+        try:
+            await autosync
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(

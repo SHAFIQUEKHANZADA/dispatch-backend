@@ -35,6 +35,13 @@ class Settings(BaseSettings):
     # Public app URL, used to build the tappable link in the tech's SMS.
     app_base_url: str = "https://get3ddispatch.com"
 
+    # --- Esther dashboard auto-sync -----------------------------------------
+    # When > 0, this always-on backend pulls GHL + myKaarma into the esther_*
+    # tables every N minutes, so the dashboard stays near-real-time without any
+    # external scheduler. 0 = off (the default — local dev, tests, other deploys
+    # that shouldn't sync). Set to 5 on the hosted backend.
+    esther_autosync_minutes: int = 0
+
     # Demo clock.  When set (ISO 8601), the app scores "now" against this instant
     # instead of the wall clock, so the demo board is alive at any hour and the
     # Match Scores are reproducible.  seed.py writes this. Leave empty in prod.
