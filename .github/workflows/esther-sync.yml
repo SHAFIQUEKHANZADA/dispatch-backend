@@ -1,0 +1,39 @@
+name: Esther dashboard sync
+
+# Keeps the Esther dashboard live: pulls the latest calls + appointments from
+# GHL/myKaarma into Supabase every 15 minutes. No server to babysit.
+on:
+  schedule:
+    - cron: "*/15 * * * *" # every 15 min (UTC). Lower the frequency if you hit Actions-minute limits.
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "How many days back to sync"
+        default: "2"
+
+concurrency:
+  group: esther-sync
+  cancel-in-progress: false # never overlap two syncs
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GHL_TOKEN__mcgrath_honda_stcharles: ${{ secrets.GHL_TOKEN_STCHARLES }}
+          GHL_TOKEN__mcgrath_honda_elgin: ${{ secrets.GHL_TOKEN_ELGIN }}
+          GHL_TOKEN__mcgrath_kia_stcharles: ${{ secrets.GHL_TOKEN_KIA }}
+        run: python esther_ingest.py ${{ github.event.inputs.days || '2' }}
