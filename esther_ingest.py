@@ -214,16 +214,145 @@ def derive_call(c: dict, tz: ZoneInfo) -> dict:
     }
 
 
-async def sync_calls(pg, store: dict, since_ms: int, tokens: dict[str, str]) -> int:
+# ── Call events (the real, date-accurate source) ─────────────────────────────
+# GHL bins its own dashboard by contact-created date, which mis-dates every
+# returning caller (a customer created weeks ago who calls today counts on their
+# signup day, not today). To be truly daily-accurate we count actual CALL events
+# by the call's own timestamp, and read outcome/intent from the contact's tags.
+
+def fetch_active_conversations(loc: str, token: str, since_ms: int) -> list[dict]:
+    """Conversations with any activity since `since_ms`, newest first."""
+    H = {"Authorization": f"Bearer {token}", "Version": "2021-07-28", "Accept": "application/json"}
+    out: list[dict] = []
+    after = None
+    with httpx.Client(timeout=30) as client:
+        for _ in range(300):  # safety cap
+            p = {"locationId": loc, "limit": 100, "sortBy": "last_message_date", "sort": "desc"}
+            if after:
+                p["startAfterDate"] = after
+            r = client.get(f"{GHL_BASE}/conversations/search", headers=H, params=p)
+            if r.status_code != 200:
+                break
+            arr = r.json().get("conversations") or []
+            if not arr:
+                break
+            stop = False
+            for cv in arr:
+                if (cv.get("lastMessageDate") or 0) < since_ms:
+                    stop = True
+                    break
+                out.append(cv)
+            if stop or len(arr) < 100:
+                break
+            after = arr[-1].get("sort", [None])[-1]
+    return out
+
+
+def fetch_call_messages(client: httpx.Client, conv_id: str, token: str, since_ms: int) -> list[dict]:
+    """TYPE_CALL messages in a conversation since `since_ms` (each = one call)."""
+    H = {"Authorization": f"Bearer {token}", "Version": "2021-07-28", "Accept": "application/json"}
+    r = client.get(f"{GHL_BASE}/conversations/{conv_id}/messages", headers=H)
+    if r.status_code != 200:
+        return []
+    body = r.json().get("messages")
+    arr = body.get("messages") if isinstance(body, dict) else body
+    out: list[dict] = []
+    for m in arr or []:
+        if m.get("messageType") != "TYPE_CALL":
+            continue
+        dt = _parse_dt(m.get("dateAdded"))
+        if dt.timestamp() * 1000 >= since_ms:
+            out.append({"id": m.get("id"), "ts": dt, "direction": (m.get("direction") or "inbound")})
+    return out
+
+
+def fetch_contact(client: httpx.Client, contact_id: str, token: str) -> dict | None:
+    H = {"Authorization": f"Bearer {token}", "Version": "2021-07-28", "Accept": "application/json"}
+    r = client.get(f"{GHL_BASE}/contacts/{contact_id}", headers=H)
+    if r.status_code != 200:
+        return None
+    return r.json().get("contact")
+
+
+async def build_call_rows(store: dict, since_ms: int, tokens: dict[str, str]) -> list[dict]:
+    """One row per real call event, dated by the call, tags from its contact."""
     loc = store["ghl_location_id"]
     token = tokens.get(store["key"])
     if not loc or not token:
-        return 0
+        return []
     tz = ZoneInfo(store["timezone"] or "America/Chicago")
-    contacts = fetch_contacts(loc, token, since_ms)
-    rows = [derive_from_contact(c, tz) for c in contacts]
+
+    convs = await asyncio.to_thread(fetch_active_conversations, loc, token, since_ms)
+    if not convs:
+        return []
+
+    sem = asyncio.Semaphore(8)  # bound concurrency so we don't trip GHL rate limits
+
+    async def _bounded(fn, *a):
+        async with sem:
+            return await asyncio.to_thread(fn, *a)
+
+    def _calls(conv):
+        with httpx.Client(timeout=30) as c:
+            return conv.get("contactId"), fetch_call_messages(c, conv["id"], token, since_ms)
+
+    per_conv = await asyncio.gather(*[_bounded(_calls, cv) for cv in convs])
+    events: list[tuple] = []  # (call_id, contact_id, ts, direction)
+    contact_ids: set[str] = set()
+    for contact_id, calls in per_conv:
+        for call in calls:
+            events.append((call["id"], contact_id, call["ts"], call["direction"]))
+            if contact_id:
+                contact_ids.add(contact_id)
+    if not events:
+        return []
+
+    def _contact(cid):
+        with httpx.Client(timeout=30) as c:
+            return cid, fetch_contact(c, cid, token)
+
+    fetched = dict(await asyncio.gather(*[_bounded(_contact, cid) for cid in contact_ids]))
+    derived = {cid: (derive_from_contact(ct, tz) if ct else {}) for cid, ct in fetched.items()}
+
+    rows: list[dict] = []
+    for call_id, cid, ts, direction in events:
+        d = derived.get(cid) or {}
+        rows.append({
+            "ghl_conversation_id": None,
+            "ghl_contact_id": cid,
+            "ghl_message_id": call_id,  # stable per call → no history mutation
+            "started_at": ts,
+            "local_date": ts.astimezone(tz).date(),
+            "direction": str(direction).lower(),
+            "department": d.get("department"),
+            "outcome": d.get("outcome"),
+            "intent": d.get("intent"),
+            "transferred": d.get("transferred", False),
+            "transfer_succeeded": None,
+            "callback_needed": d.get("callback_needed", False),
+            "needs_attention": d.get("needs_attention", False),
+            "tags": d.get("tags", []),
+        })
+    return rows
+
+
+async def sync_calls(pg, store: dict, since_ms: int, tokens: dict[str, str]) -> int:
+    rows = await build_call_rows(store, since_ms, tokens)
     if not rows:
         return 0
+    # The window is rebuilt from real call events, so clear whatever was there
+    # first (incl. legacy contact-dated rows) to avoid double counting.
+    tz = ZoneInfo(store["timezone"] or "America/Chicago")
+    win_start = datetime.fromtimestamp(since_ms / 1000, tz).date()
+    # recovered rows reference calls (FK), so clear them for the window first
+    await pg.execute(
+        "delete from esther_recovered_opportunities where store_id=$1 and local_date >= $2",
+        store["id"], win_start,
+    )
+    await pg.execute(
+        "delete from esther_calls where store_id=$1 and local_date >= $2",
+        store["id"], win_start,
+    )
     params = [
         (
             store["id"], r["ghl_conversation_id"], r["ghl_contact_id"], r["ghl_message_id"],
@@ -375,24 +504,24 @@ async def rollup(pg, store_id, date: str) -> None:
         select
           $1, $2,
           (select count(*) from c),
-          (select count(*) from c where outcome='booked'),
-          (select count(*) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'),
-          case when (select count(*) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript') > 0
-               then round(100.0 * (select count(*) from c where outcome='booked')
-                    / (select count(*) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'), 2)
+          (select count(distinct ghl_contact_id) from c where outcome='booked'),
+          (select count(distinct ghl_contact_id) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'),
+          case when (select count(distinct ghl_contact_id) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript') > 0
+               then round(100.0 * (select count(distinct ghl_contact_id) from c where outcome='booked')
+                    / (select count(distinct ghl_contact_id) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'), 2)
                else null end,
           (select count(*) from c where transferred),
           (select count(*) from c where transferred and transfer_succeeded is false),
           (select count(*) from c where outcome='dropped'),
-          (select count(*) from c where callback_needed),
+          (select count(distinct ghl_contact_id) from c where callback_needed),
           -- recovered: an at-risk contact (dropped / callback-needed / needs-attention)
           -- that ultimately booked. Detected from the tags we already store.
-          (select count(*) from c where outcome='booked'
+          (select count(distinct ghl_contact_id) from c where outcome='booked'
              and tags && array['dropped','callback-needed','needs-attention']),
           coalesce((select jsonb_object_agg(k, n) from intent), '{}'::jsonb),
           (select spend from sp),
-          case when (select spend from sp) is not null and (select count(*) from c where outcome='booked') > 0
-               then round((select spend from sp) / (select count(*) from c where outcome='booked'), 2)
+          case when (select spend from sp) is not null and (select count(distinct ghl_contact_id) from c where outcome='booked') > 0
+               then round((select spend from sp) / (select count(distinct ghl_contact_id) from c where outcome='booked'), 2)
                else null end,
           now()
         on conflict (store_id, local_date) do update set
@@ -420,10 +549,12 @@ async def sync_recovered(pg, store_id, date) -> None:
         """
         insert into esther_recovered_opportunities
           (store_id, local_date, original_call_id, recovery_call_id, intent, outcome, value, recovered_at)
-        select store_id, local_date, id, id, intent, 'Booked', null, started_at
+        select distinct on (ghl_contact_id)
+               store_id, local_date, id, id, intent, 'Booked', null, started_at
         from esther_calls
         where store_id=$1 and local_date=$2 and outcome='booked'
           and tags && array['dropped','callback-needed','needs-attention']
+        order by ghl_contact_id, started_at
         """,
         store_id, date,
     )
