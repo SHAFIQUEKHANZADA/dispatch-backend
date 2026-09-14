@@ -248,21 +248,58 @@ def fetch_active_conversations(loc: str, token: str, since_ms: int) -> list[dict
     return out
 
 
-def fetch_call_messages(client: httpx.Client, conv_id: str, token: str, since_ms: int) -> list[dict]:
-    """TYPE_CALL messages in a conversation since `since_ms` (each = one call)."""
+def classify_summary(text: str | None) -> dict:
+    """Per-call outcome from Esther's post-call summary comment. Event-based, so it
+    does NOT over-count returning callers the way sticky contact tags do."""
+    t = (text or "").lower()
+    transferred = "transfer" in t
+    callback = "callback" in t or "call back" in t
+    booked = "booked" in t or "appointment confirmed" in t or "scheduled service" in t
+    dropped = any(w in t for w in (
+        "voicemail", "unresolved", "no resolution", "dropped", "no appointment",
+        "hung up", "disconnected", "abandoned",
+    ))
+    if booked:
+        outcome = "booked"
+    elif callback:
+        outcome = "callback_needed"
+    elif dropped:
+        outcome = "dropped"
+    elif t:
+        outcome = "info_only"
+    else:
+        outcome = None  # no summary yet (call just happened / not classified)
+    return {"outcome": outcome, "transferred": transferred, "callback_needed": callback}
+
+
+def fetch_call_events(client: httpx.Client, conv_id: str, token: str, since_ms: int) -> list[dict]:
+    """Each call in the window paired with the summary comment that follows it,
+    giving a per-call outcome (transferred / callback / dropped / booked)."""
     H = {"Authorization": f"Bearer {token}", "Version": "2021-07-28", "Accept": "application/json"}
     r = client.get(f"{GHL_BASE}/conversations/{conv_id}/messages", headers=H)
     if r.status_code != 200:
         return []
     body = r.json().get("messages")
     arr = body.get("messages") if isinstance(body, dict) else body
+    # messages come newest-first; work oldest-first so a call can find its summary
+    msgs = sorted(arr or [], key=lambda m: _parse_dt(m.get("dateAdded")))
     out: list[dict] = []
-    for m in arr or []:
+    for i, m in enumerate(msgs):
         if m.get("messageType") != "TYPE_CALL":
             continue
         dt = _parse_dt(m.get("dateAdded"))
-        if dt.timestamp() * 1000 >= since_ms:
-            out.append({"id": m.get("id"), "ts": dt, "direction": (m.get("direction") or "inbound")})
+        if dt.timestamp() * 1000 < since_ms:
+            continue
+        # summary = first internal comment after this call and before the next call
+        summary = None
+        for n in msgs[i + 1:]:
+            if n.get("messageType") == "TYPE_CALL":
+                break
+            if n.get("messageType") == "TYPE_INTERNAL_COMMENT" and (n.get("body") or "").strip():
+                summary = n.get("body")
+                break
+        cls = classify_summary(summary)
+        out.append({"id": m.get("id"), "ts": dt, "direction": (m.get("direction") or "inbound"), **cls})
     return out
 
 
@@ -294,14 +331,14 @@ async def build_call_rows(store: dict, since_ms: int, tokens: dict[str, str]) ->
 
     def _calls(conv):
         with httpx.Client(timeout=30) as c:
-            return conv.get("contactId"), fetch_call_messages(c, conv["id"], token, since_ms)
+            return conv.get("contactId"), fetch_call_events(c, conv["id"], token, since_ms)
 
     per_conv = await asyncio.gather(*[_bounded(_calls, cv) for cv in convs])
-    events: list[tuple] = []  # (call_id, contact_id, ts, direction)
+    events: list[tuple] = []  # (contact_id, call dict)
     contact_ids: set[str] = set()
     for contact_id, calls in per_conv:
         for call in calls:
-            events.append((call["id"], contact_id, call["ts"], call["direction"]))
+            events.append((contact_id, call))
             if contact_id:
                 contact_ids.add(contact_id)
     if not events:
@@ -315,21 +352,23 @@ async def build_call_rows(store: dict, since_ms: int, tokens: dict[str, str]) ->
     derived = {cid: (derive_from_contact(ct, tz) if ct else {}) for cid, ct in fetched.items()}
 
     rows: list[dict] = []
-    for call_id, cid, ts, direction in events:
+    for cid, call in events:
         d = derived.get(cid) or {}
         rows.append({
             "ghl_conversation_id": None,
             "ghl_contact_id": cid,
-            "ghl_message_id": call_id,  # stable per call → no history mutation
-            "started_at": ts,
-            "local_date": ts.astimezone(tz).date(),
-            "direction": str(direction).lower(),
+            "ghl_message_id": call["id"],  # stable per call → no history mutation
+            "started_at": call["ts"],
+            "local_date": call["ts"].astimezone(tz).date(),
+            "direction": str(call["direction"]).lower(),
+            # department + intent from the contact (stable), but OUTCOME per call from
+            # the call's own summary — so returning callers aren't re-counted.
             "department": d.get("department"),
-            "outcome": d.get("outcome"),
+            "outcome": call["outcome"],
             "intent": d.get("intent"),
-            "transferred": d.get("transferred", False),
+            "transferred": call["transferred"],
             "transfer_succeeded": None,
-            "callback_needed": d.get("callback_needed", False),
+            "callback_needed": call["callback_needed"],
             "needs_attention": d.get("needs_attention", False),
             "tags": d.get("tags", []),
         })
