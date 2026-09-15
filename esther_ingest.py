@@ -539,6 +539,7 @@ async def rollup(pg, store_id, date: str) -> None:
         insert into esther_daily_metrics as dm
           (store_id, local_date, total_calls, appointments_booked, eligible_calls, booking_pct,
            transfers, failed_transfers, dropped_calls, callbacks_needed, recovered_count,
+           contained_calls, containment_rate,
            intent_breakdown, ai_spend, cost_per_booking, updated_at)
         select
           $1, $2,
@@ -557,6 +558,17 @@ async def rollup(pg, store_id, date: str) -> None:
           -- that ultimately booked. Detected from the tags we already store.
           (select count(distinct ghl_contact_id) from c where outcome='booked'
              and tags && array['dropped','callback-needed','needs-attention']),
+          -- AI Resolution / Containment: eligible calls Esther resolved on her own
+          -- (booked or info-only) OR correctly routed to a human (successful transfer).
+          (select count(distinct ghl_contact_id) from c
+             where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'
+               and (outcome in ('booked','info_only') or (transferred and transfer_succeeded is not false))),
+          case when (select count(distinct ghl_contact_id) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript') > 0
+               then round(100.0 * (select count(distinct ghl_contact_id) from c
+                        where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'
+                          and (outcome in ('booked','info_only') or (transferred and transfer_succeeded is not false)))
+                    / (select count(distinct ghl_contact_id) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'), 2)
+               else null end,
           coalesce((select jsonb_object_agg(k, n) from intent), '{}'::jsonb),
           (select spend from sp),
           case when (select spend from sp) is not null and (select count(distinct ghl_contact_id) from c where outcome='booked') > 0
@@ -569,6 +581,7 @@ async def rollup(pg, store_id, date: str) -> None:
           transfers=excluded.transfers, failed_transfers=excluded.failed_transfers,
           dropped_calls=excluded.dropped_calls, callbacks_needed=excluded.callbacks_needed,
           recovered_count=excluded.recovered_count,
+          contained_calls=excluded.contained_calls, containment_rate=excluded.containment_rate,
           intent_breakdown=excluded.intent_breakdown,
           ai_spend=excluded.ai_spend, cost_per_booking=excluded.cost_per_booking, updated_at=now()
         """,
