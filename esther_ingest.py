@@ -299,7 +299,8 @@ def fetch_call_events(client: httpx.Client, conv_id: str, token: str, since_ms: 
                 summary = n.get("body")
                 break
         cls = classify_summary(summary)
-        out.append({"id": m.get("id"), "ts": dt, "direction": (m.get("direction") or "inbound"), **cls})
+        out.append({"id": m.get("id"), "ts": dt, "direction": (m.get("direction") or "inbound"),
+                    "summary": summary, **cls})
     return out
 
 
@@ -371,6 +372,7 @@ async def build_call_rows(store: dict, since_ms: int, tokens: dict[str, str]) ->
             "callback_needed": call["callback_needed"],
             "needs_attention": d.get("needs_attention", False),
             "tags": d.get("tags", []),
+            "summary": call.get("summary"),  # stored so the classifier can read it
         })
     return rows
 
@@ -397,7 +399,7 @@ async def sync_calls(pg, store: dict, since_ms: int, tokens: dict[str, str]) -> 
             store["id"], r["ghl_conversation_id"], r["ghl_contact_id"], r["ghl_message_id"],
             r["started_at"], r["local_date"], r["direction"], r["department"], r["outcome"],
             r["intent"], r["transferred"], r["transfer_succeeded"], r["callback_needed"],
-            r["needs_attention"], r["tags"],
+            r["needs_attention"], r["tags"], r["summary"],
         )
         for r in rows
     ]
@@ -406,13 +408,13 @@ async def sync_calls(pg, store: dict, since_ms: int, tokens: dict[str, str]) -> 
         insert into esther_calls
           (store_id, ghl_conversation_id, ghl_contact_id, ghl_message_id, started_at,
            local_date, direction, department, outcome, intent, transferred,
-           transfer_succeeded, callback_needed, needs_attention, tags)
-        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+           transfer_succeeded, callback_needed, needs_attention, tags, summary)
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
         on conflict (ghl_message_id) do update set
            outcome=excluded.outcome, intent=excluded.intent, department=excluded.department,
            transferred=excluded.transferred, transfer_succeeded=excluded.transfer_succeeded,
            callback_needed=excluded.callback_needed, needs_attention=excluded.needs_attention,
-           tags=excluded.tags, started_at=excluded.started_at
+           tags=excluded.tags, started_at=excluded.started_at, summary=excluded.summary
         """,
         params,
     )
@@ -645,6 +647,20 @@ async def run_ingest(days: int, log=print) -> list[dict]:
                 await sync_recovered(pg, store["id"], d)
         summary.append({"store": store["name"], "calls": nc, "appointments": na})
         log(f"{store['name']:<32} calls={nc:<5} appts={na:<5} (rolled {days} days)")
+
+    # Classify recent calls with Claude (fine intent, transfer reason, sentiment) —
+    # once per call, cached by message id so the window rebuild never re-charges it.
+    # Best-effort: a classifier hiccup must never fail the data sync.
+    try:
+        from app.services.esther_classifier import classify_unclassified, enabled as cls_enabled
+        if cls_enabled():
+            async with engine.begin() as conn:
+                pg = (await conn.get_raw_connection()).driver_connection
+                nclass = await classify_unclassified(pg, limit=80)
+            log(f"{'classifier':<32} classified={nclass}")
+    except Exception as e:  # noqa: BLE001 — never let classification break the sync
+        log(f"classifier skipped: {e}")
+
     return summary
 
 
