@@ -548,8 +548,12 @@ async def rollup(pg, store_id, date: str) -> None:
           (select count(*) from c),
           (select count(distinct ghl_contact_id) from c where outcome='booked'),
           (select count(distinct ghl_contact_id) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'),
+          -- Conversion = bookings AMONG eligible calls ÷ eligible calls. Numerator and
+          -- denominator must share the same population (service/sales, non no_transcript),
+          -- otherwise untagged bookings push the rate past 100% — and past 999.99 it
+          -- overflows booking_pct's NUMERIC and crashes the whole store's rollup.
           case when (select count(distinct ghl_contact_id) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript') > 0
-               then round(100.0 * (select count(distinct ghl_contact_id) from c where outcome='booked')
+               then round(100.0 * (select count(distinct ghl_contact_id) from c where outcome='booked' and department in ('service','sales'))
                     / (select count(distinct ghl_contact_id) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'), 2)
                else null end,
           (select count(*) from c where transferred),

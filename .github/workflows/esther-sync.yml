@@ -1,10 +1,9 @@
 name: Esther dashboard sync
 
-# Keeps the Esther dashboard live: pulls the latest calls + appointments from
-# GHL/myKaarma into Supabase every 15 minutes. No server to babysit.
+# Manual backup sync only. The live sync runs on Railway's always-on backend
+# (ESTHER_AUTOSYNC_MINUTES) — the scheduled cron here was unreliable (delayed/
+# skipped runs) and is disabled. Kept as a manually-triggerable fallback.
 on:
-  schedule:
-    - cron: "*/15 * * * *" # every 15 min (UTC). Lower the frequency if you hit Actions-minute limits.
   workflow_dispatch:
     inputs:
       days:
