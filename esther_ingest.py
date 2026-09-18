@@ -599,20 +599,61 @@ async def rollup(pg, store_id, date: str) -> None:
     )
 
 
+# Estimated $ value of a recovered service booking, matched from the call summary
+# against McGrath's Honda + Acura price books (values blended across the two brands).
+# Paid services are matched first (most specific → general); recalls / warranty /
+# software cost the customer nothing ($0); an unrecognised service falls back to a
+# modest average RO. These are labeled ESTIMATES — change any number freely.
+DEFAULT_SERVICE_VALUE = 120
+RECALL_VALUE = 0
+SERVICE_PRICES: list[tuple[tuple[str, ...], int]] = [
+    # bundled maintenance codes first, so a combo isn't priced as its cheapest part.
+    (("timing belt", "4 service"), 1600),
+    (("b service", "b-1", "b1 service", "b12", "b16", "oil change + inspection", "oil change and inspection"), 225),
+    (("a1 service", "a1 serv"), 130),   # oil + filter + tire rotation bundle
+    (("brake flush", "brake fluid", "7 service"), 155),
+    (("brake",), 200),
+    (("alignment",), 140),
+    (("coolant", "5 service", "cooling system"), 169),
+    (("power steering",), 199),
+    (("transmission", "cvt", "3 service"), 180),
+    (("differential", "6 service", "transfer case"), 130),
+    (("fuel induction",), 175),
+    (("diagnos", "check engine"), 189),
+    (("battery",), 50),
+    (("cabin", "engine air filter", "air filter", "2 service"), 100),
+    (("a service", "a serv", "oil and filter", "oil & filter", "oil change", "oil"), 75),
+    (("tire rotation", "1 service"), 35),
+    (("tire",), 45),
+    # recalls / warranty / software last: only when no paid service was mentioned.
+    (("recall", "warranty", "software", "product update", "carplay", "sensing system", "aim and relearn"), RECALL_VALUE),
+]
+
+
+def estimate_service_value(summary: str | None, intent: str | None) -> int:
+    """Best-guess $ value of the service the recovered customer booked, from the
+    call summary (falling back to the coarse intent when there's no summary)."""
+    t = (summary or "").lower()
+    if not t.strip():
+        t = (intent or "").lower()
+    for kws, price in SERVICE_PRICES:
+        if any(k in t for k in kws):
+            return price
+    return DEFAULT_SERVICE_VALUE
+
+
 async def sync_recovered(pg, store_id, date) -> None:
     """Repopulate the recovered-opportunities drill-down for one store-day:
     contacts that were at risk (dropped / callback-needed / needs-attention) yet
-    ultimately booked. Rebuilt each run so it stays in sync with the tags."""
+    ultimately booked. Each row's value is the estimated price of the service they
+    booked (from the summary), not a flat number. Rebuilt each run."""
     await pg.execute(
         "delete from esther_recovered_opportunities where store_id=$1 and local_date=$2",
         store_id, date,
     )
-    await pg.execute(
+    rows = await pg.fetch(
         """
-        insert into esther_recovered_opportunities
-          (store_id, local_date, original_call_id, recovery_call_id, intent, outcome, value, recovered_at)
-        select distinct on (ghl_contact_id)
-               store_id, local_date, id, id, intent, 'Booked', null, started_at
+        select distinct on (ghl_contact_id) id, intent, summary, started_at
         from esther_calls
         where store_id=$1 and local_date=$2 and outcome='booked'
           and tags && array['dropped','callback-needed','needs-attention']
@@ -620,6 +661,21 @@ async def sync_recovered(pg, store_id, date) -> None:
         order by ghl_contact_id, started_at
         """,
         store_id, date,
+    )
+    if not rows:
+        return
+    params = [
+        (store_id, date, r["id"], r["id"], r["intent"], "Booked",
+         estimate_service_value(r["summary"], r["intent"]), r["started_at"])
+        for r in rows
+    ]
+    await pg.executemany(
+        """
+        insert into esther_recovered_opportunities
+          (store_id, local_date, original_call_id, recovery_call_id, intent, outcome, value, recovered_at)
+        values ($1,$2,$3,$4,$5,$6,$7,$8)
+        """,
+        params,
     )
 
 
