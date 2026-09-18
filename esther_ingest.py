@@ -524,7 +524,11 @@ async def rollup(pg, store_id, date: str) -> None:
     await pg.execute(
         """
         with c as (
+          -- Exclude QA / secret-shopper test calls (qa-line tag) so scripted test
+          -- calls never inflate real performance. They live in the St. Charles Honda
+          -- account and are scored separately as the Secret Shopper metric.
           select * from esther_calls where store_id=$1 and local_date=$2
+            and (tags is null or not (tags @> array['qa-line']))
         ), a as (
           select * from esther_appointments where store_id=$1 and local_date=$2
         ), intent as (
@@ -612,6 +616,7 @@ async def sync_recovered(pg, store_id, date) -> None:
         from esther_calls
         where store_id=$1 and local_date=$2 and outcome='booked'
           and tags && array['dropped','callback-needed','needs-attention']
+          and not (tags @> array['qa-line'])  -- never surface QA test calls as recovered
         order by ghl_contact_id, started_at
         """,
         store_id, date,
