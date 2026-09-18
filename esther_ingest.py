@@ -726,6 +726,18 @@ async def run_ingest(days: int, log=print) -> list[dict]:
     except Exception as e:  # noqa: BLE001 — never let classification break the sync
         log(f"classifier skipped: {e}")
 
+    # Secret Shopper: grade the QA (qa-line) shop calls with Claude — once per call,
+    # cached by message id. Best-effort: a grader hiccup must never fail the sync.
+    try:
+        from app.services.esther_qa_grader import grade_ungraded, enabled as qa_enabled
+        if qa_enabled():
+            async with engine.begin() as conn:
+                pg = (await conn.get_raw_connection()).driver_connection
+                ngraded = await grade_ungraded(pg, limit=40)
+            log(f"{'qa_grader':<32} graded={ngraded}")
+    except Exception as e:  # noqa: BLE001 — never let QA grading break the sync
+        log(f"qa grader skipped: {e}")
+
     return summary
 
 
