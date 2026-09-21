@@ -381,19 +381,12 @@ async def sync_calls(pg, store: dict, since_ms: int, tokens: dict[str, str]) -> 
     rows = await build_call_rows(store, since_ms, tokens)
     if not rows:
         return 0
-    # The window is rebuilt from real call events, so clear whatever was there
-    # first (incl. legacy contact-dated rows) to avoid double counting.
-    tz = ZoneInfo(store["timezone"] or "America/Chicago")
-    win_start = datetime.fromtimestamp(since_ms / 1000, tz).date()
-    # recovered rows reference calls (FK), so clear them for the window first
-    await pg.execute(
-        "delete from esther_recovered_opportunities where store_id=$1 and local_date >= $2",
-        store["id"], win_start,
-    )
-    await pg.execute(
-        "delete from esther_calls where store_id=$1 and local_date >= $2",
-        store["id"], win_start,
-    )
+    # UPSERT ONLY — never delete the window. Calls have a stable ghl_message_id, so
+    # re-fetches update in place. A GHL fetch can be partial (rate limits, or a call's
+    # summary not posted yet), and a delete-then-reinsert would drop calls the day
+    # already counted, making the live number visibly fall on refresh. Adding without
+    # deleting keeps the day's count steady and only climbing. (Legacy contact-dated
+    # rows were cleared once, long ago, so there's nothing left to purge.)
     params = [
         (
             store["id"], r["ghl_conversation_id"], r["ghl_contact_id"], r["ghl_message_id"],
