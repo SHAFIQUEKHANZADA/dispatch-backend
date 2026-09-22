@@ -579,9 +579,15 @@ async def sync_appointments(pg, session_factory, store: dict, day_lo, day_hi, tz
 
 
 # ── Rollup ────────────────────────────────────────────────
-async def rollup(pg, store_id, date: str) -> None:
-    await pg.execute(
-        """
+async def rollup(pg, store_id, date: str, per_call: bool = False) -> None:
+    # Most stores dedup bookings/eligibility by CONTACT, so a customer who calls
+    # twice about one appointment counts once. Kia forwards every caller through a
+    # single number, so GHL collapses ALL its callers into ONE contact — making
+    # `count(distinct contact)` read 1 no matter how many真 booked. For that store
+    # we dedup by CALL (ghl_message_id) instead — one row per real call — so each
+    # forwarded caller's booking is counted.
+    dk = "ghl_message_id" if per_call else "ghl_contact_id"
+    sql = """
         with c as (
           -- Exclude QA / secret-shopper test calls (qa-line tag) so scripted test
           -- calls never inflate real performance. They live in the St. Charles Honda
@@ -656,9 +662,14 @@ async def rollup(pg, store_id, date: str) -> None:
           contained_calls=excluded.contained_calls, containment_rate=excluded.containment_rate,
           intent_breakdown=excluded.intent_breakdown,
           ai_spend=excluded.ai_spend, cost_per_booking=excluded.cost_per_booking, updated_at=now()
-        """,
-        store_id, date,
-    )
+        """
+    # Swap the dedup key for the collapsed-caller-ID store. Only the booking /
+    # eligibility / containment counts use `distinct ghl_contact_id`; transfers,
+    # dropped and intent do not, so they are unaffected. `dk` is an internal
+    # constant, never user input, so this interpolation is safe.
+    if per_call:
+        sql = sql.replace("distinct ghl_contact_id", f"distinct {dk}")
+    await pg.execute(sql, store_id, date)
 
 
 # Estimated $ value of a recovered service booking, matched from the call summary
@@ -704,23 +715,25 @@ def estimate_service_value(summary: str | None, intent: str | None) -> int:
     return DEFAULT_SERVICE_VALUE
 
 
-async def sync_recovered(pg, store_id, date) -> None:
+async def sync_recovered(pg, store_id, date, per_call: bool = False) -> None:
     """Repopulate the recovered-opportunities drill-down for one store-day:
     contacts that were at risk (dropped / callback-needed / needs-attention) yet
     ultimately booked. Each row's value is the estimated price of the service they
-    booked (from the summary), not a flat number. Rebuilt each run."""
+    booked (from the summary), not a flat number. Rebuilt each run.
+    per_call: dedup by call, not contact — for the collapsed-caller-ID store (Kia)."""
     await pg.execute(
         "delete from esther_recovered_opportunities where store_id=$1 and local_date=$2",
         store_id, date,
     )
+    dedup = "id" if per_call else "ghl_contact_id"
     rows = await pg.fetch(
-        """
-        select distinct on (ghl_contact_id) id, intent, summary, started_at
+        f"""
+        select distinct on ({dedup}) id, intent, summary, started_at
         from esther_calls
         where store_id=$1 and local_date=$2 and outcome='booked'
           and tags && array['dropped','callback-needed','needs-attention']
           and not (tags @> array['qa-line'])  -- never surface QA test calls as recovered
-        order by ghl_contact_id, started_at
+        order by {dedup}, started_at
         """,
         store_id, date,
     )
@@ -781,10 +794,14 @@ async def run_ingest(days: int, log=print) -> list[dict]:
                     log(f"{store['name']:<32} appraisal threads={ne}")
             except Exception as e:  # noqa: BLE001
                 log(f"equity messages skipped for {store['name']}: {e}")
+            # Kia forwards all callers through one number → GHL collapses them into
+            # a single contact, so its bookings must be counted per call, not per
+            # contact. (Fix the forwarding to pass caller ID and this can be removed.)
+            per_call = store["key"] == "mcgrath_kia_stcharles"
             for n in range(days):
                 d = day_lo + timedelta(n)
-                await rollup(pg, store["id"], d)
-                await sync_recovered(pg, store["id"], d)
+                await rollup(pg, store["id"], d, per_call)
+                await sync_recovered(pg, store["id"], d, per_call)
         summary.append({"store": store["name"], "calls": nc, "appointments": na})
         log(f"{store['name']:<32} calls={nc:<5} appts={na:<5} (rolled {days} days)")
 
