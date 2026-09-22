@@ -609,6 +609,7 @@ async def rollup(pg, store_id, date: str, per_call: bool = False) -> None:
         )
         insert into esther_daily_metrics as dm
           (store_id, local_date, total_calls, appointments_booked, eligible_calls, booking_pct,
+           booking_attempts,
            transfers, failed_transfers, dropped_calls, callbacks_needed, recovered_count,
            contained_calls, containment_rate,
            intent_breakdown, ai_spend, cost_per_booking, updated_at)
@@ -625,6 +626,11 @@ async def rollup(pg, store_id, date: str, per_call: bool = False) -> None:
                then round(100.0 * (select count(distinct ghl_contact_id) from c where outcome='booked' and department in ('service','sales'))
                     / (select count(distinct ghl_contact_id) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'), 2)
                else null end,
+          -- Booking attempts = calls that reached a booking DECISION (booked /
+          -- callback-needed / dropped). Denominator for appointment-specific
+          -- conversion (booked ÷ attempts ≈ 80%); excludes pure-info calls.
+          (select count(distinct ghl_contact_id) from c
+             where outcome in ('booked','callback_needed','dropped')),
           -- Transfers shown on the dashboard are SERVICE transfers only (Reid's ask):
           -- Esther is the service line, so sales hand-offs are excluded. Unclassified
           -- (no dept tag) counts as service since that is what Esther is.
@@ -656,6 +662,7 @@ async def rollup(pg, store_id, date: str, per_call: bool = False) -> None:
         on conflict (store_id, local_date) do update set
           total_calls=excluded.total_calls, appointments_booked=excluded.appointments_booked,
           eligible_calls=excluded.eligible_calls, booking_pct=excluded.booking_pct,
+          booking_attempts=excluded.booking_attempts,
           transfers=excluded.transfers, failed_transfers=excluded.failed_transfers,
           dropped_calls=excluded.dropped_calls, callbacks_needed=excluded.callbacks_needed,
           recovered_count=excluded.recovered_count,
