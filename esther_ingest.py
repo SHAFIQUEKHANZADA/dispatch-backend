@@ -34,6 +34,60 @@ BOOKED_TAGS = {"service-booked", "sales-booked", "call-booked-ai"}
 TRANSFER_TAGS = {"transferred", "call-transferred"}
 FAILED_CALL_STATUS = {"no-answer", "busy", "failed", "voicemail", "canceled", "cancelled"}
 
+# Esther's transfer detection reads the actual call TRANSCRIPT, spoken by the
+# assistant (speaker 0). This is the authoritative per-call signal: the one-line
+# post-call summary often records only the outcome ("Rescheduled service to Oct
+# 2…") and never mentions the handoff, and the GHL `transferred` contact TAG is
+# sticky (it lingers on a contact across their later calls, over-counting).
+#
+# The catch: Esther says a *conditional* reassurance on nearly every call
+# ("give me a chance, and if I can't get it handled, I'll connect you with
+# someone") and sometimes *offers* ("would you like me to connect you?") — she
+# then handles it herself. Those are NOT transfers. So we require a COMMITTED
+# handoff phrase AND reject any line carrying a conditional/offer marker. Verified
+# against real calls: every committed line is followed by a human picking up
+# ("Thanks for calling McGrath… this is Mindy").
+TRANSFER_COMMIT = (
+    "transfer your call", "transferring your call", "transfer you to",
+    "please hold while i transfer", "one moment while i transfer",
+    "connecting you now", "connecting you with", "i'm connecting you",
+    "let me connect you", "i'll connect you", "let me transfer", "let me get you connected",
+)
+TRANSFER_CONDITIONAL = (
+    "if i can", "if you'd", "if you would", "would you like", "i can also",
+    "or i can", "whether i can", "anytime you", "just ask", "check availability",
+    "i can either", "either book", "want me to connect", "if needed", "if necessary",
+    "can i connect", "may i connect",
+)
+
+
+def transcript_shows_transfer(segs: list[dict] | None) -> bool:
+    """True when Esther (speaker 0) actually hands the caller to a human. A line
+    counts only if it commits to the transfer and is not a conditional offer."""
+    for s in segs or []:
+        if s.get("speaker") == 0:
+            t = (s.get("transcript") or "").lower()
+            if any(p in t for p in TRANSFER_COMMIT) and not any(k in t for k in TRANSFER_CONDITIONAL):
+                return True
+    return False
+
+
+def fetch_transcription(client: httpx.Client, loc: str, message_id: str, token: str) -> list[dict] | None:
+    """The call's transcript segments, or None if not available yet (recording still
+    processing, or a call with no transcript). Callers fall back to the summary."""
+    H = {"Authorization": f"Bearer {token}", "Version": "2021-07-28", "Accept": "application/json"}
+    try:
+        r = client.get(
+            f"{GHL_BASE}/conversations/locations/{loc}/messages/{message_id}/transcription",
+            headers=H,
+        )
+        if r.status_code == 200:
+            body = r.json()
+            return body if isinstance(body, list) else (body.get("transcript") or body.get("transcripts"))
+    except Exception:
+        pass
+    return None
+
 
 def load_ghl_tokens() -> dict[str, str]:
     """GHL per-store tokens, keyed by store key. Prefers env vars (production /
@@ -272,7 +326,8 @@ def classify_summary(text: str | None) -> dict:
     return {"outcome": outcome, "transferred": transferred, "callback_needed": callback}
 
 
-def fetch_call_events(client: httpx.Client, conv_id: str, token: str, since_ms: int) -> list[dict]:
+def fetch_call_events(client: httpx.Client, conv_id: str, token: str, since_ms: int,
+                      loc: str | None = None) -> list[dict]:
     """Each call in the window paired with the summary comment that follows it,
     giving a per-call outcome (transferred / callback / dropped / booked)."""
     H = {"Authorization": f"Bearer {token}", "Version": "2021-07-28", "Accept": "application/json"}
@@ -299,6 +354,13 @@ def fetch_call_events(client: httpx.Client, conv_id: str, token: str, since_ms: 
                 summary = n.get("body")
                 break
         cls = classify_summary(summary)
+        # Transfer flag: prefer the transcript (the actual call). The summary keyword
+        # under-counts (it only records outcomes) and the contact tag over-counts
+        # (sticky). Fall back to the summary keyword only when no transcript exists yet.
+        if loc:
+            segs = fetch_transcription(client, loc, m.get("id"), token)
+            if segs is not None:
+                cls = {**cls, "transferred": transcript_shows_transfer(segs)}
         out.append({"id": m.get("id"), "ts": dt, "direction": (m.get("direction") or "inbound"),
                     "duration_sec": (m.get("meta") or {}).get("call", {}).get("duration"),
                     "summary": summary, **cls})
@@ -333,7 +395,7 @@ async def build_call_rows(store: dict, since_ms: int, tokens: dict[str, str]) ->
 
     def _calls(conv):
         with httpx.Client(timeout=30) as c:
-            return conv.get("contactId"), fetch_call_events(c, conv["id"], token, since_ms)
+            return conv.get("contactId"), fetch_call_events(c, conv["id"], token, since_ms, loc)
 
     per_conv = await asyncio.gather(*[_bounded(_calls, cv) for cv in convs])
     events: list[tuple] = []  # (contact_id, call dict)
@@ -557,8 +619,11 @@ async def rollup(pg, store_id, date: str) -> None:
                then round(100.0 * (select count(distinct ghl_contact_id) from c where outcome='booked' and department in ('service','sales'))
                     / (select count(distinct ghl_contact_id) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'), 2)
                else null end,
-          (select count(*) from c where transferred),
-          (select count(*) from c where transferred and transfer_succeeded is false),
+          -- Transfers shown on the dashboard are SERVICE transfers only (Reid's ask):
+          -- Esther is the service line, so sales hand-offs are excluded. Unclassified
+          -- (no dept tag) counts as service since that is what Esther is.
+          (select count(*) from c where transferred and department is distinct from 'sales'),
+          (select count(*) from c where transferred and transfer_succeeded is false and department is distinct from 'sales'),
           (select count(*) from c where outcome='dropped'),
           (select count(distinct ghl_contact_id) from c where callback_needed),
           -- recovered: an at-risk contact (dropped / callback-needed / needs-attention)
