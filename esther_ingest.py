@@ -300,6 +300,7 @@ def fetch_call_events(client: httpx.Client, conv_id: str, token: str, since_ms: 
                 break
         cls = classify_summary(summary)
         out.append({"id": m.get("id"), "ts": dt, "direction": (m.get("direction") or "inbound"),
+                    "duration_sec": (m.get("meta") or {}).get("call", {}).get("duration"),
                     "summary": summary, **cls})
     return out
 
@@ -362,6 +363,7 @@ async def build_call_rows(store: dict, since_ms: int, tokens: dict[str, str]) ->
             "started_at": call["ts"],
             "local_date": call["ts"].astimezone(tz).date(),
             "direction": str(call["direction"]).lower(),
+            "duration_sec": call.get("duration_sec"),
             # department + intent from the contact (stable), but OUTCOME per call from
             # the call's own summary — so returning callers aren't re-counted.
             "department": d.get("department"),
@@ -392,7 +394,7 @@ async def sync_calls(pg, store: dict, since_ms: int, tokens: dict[str, str]) -> 
             store["id"], r["ghl_conversation_id"], r["ghl_contact_id"], r["ghl_message_id"],
             r["started_at"], r["local_date"], r["direction"], r["department"], r["outcome"],
             r["intent"], r["transferred"], r["transfer_succeeded"], r["callback_needed"],
-            r["needs_attention"], r["tags"], r["summary"],
+            r["needs_attention"], r["tags"], r["summary"], r["duration_sec"],
         )
         for r in rows
     ]
@@ -401,13 +403,15 @@ async def sync_calls(pg, store: dict, since_ms: int, tokens: dict[str, str]) -> 
         insert into esther_calls
           (store_id, ghl_conversation_id, ghl_contact_id, ghl_message_id, started_at,
            local_date, direction, department, outcome, intent, transferred,
-           transfer_succeeded, callback_needed, needs_attention, tags, summary)
-        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+           transfer_succeeded, callback_needed, needs_attention, tags, summary,
+           duration_sec)
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
         on conflict (ghl_message_id) do update set
            outcome=excluded.outcome, intent=excluded.intent, department=excluded.department,
            transferred=excluded.transferred, transfer_succeeded=excluded.transfer_succeeded,
            callback_needed=excluded.callback_needed, needs_attention=excluded.needs_attention,
-           tags=excluded.tags, started_at=excluded.started_at, summary=excluded.summary
+           tags=excluded.tags, started_at=excluded.started_at, summary=excluded.summary,
+           duration_sec=coalesce(excluded.duration_sec, esther_calls.duration_sec)
         """,
         params,
     )
@@ -699,6 +703,19 @@ async def run_ingest(days: int, log=print) -> list[dict]:
             pg = (await conn.get_raw_connection()).driver_connection
             nc = await sync_calls(pg, store, since_ms, tokens)
             na = await sync_appointments(pg, None, store, day_lo, today, tz)
+            # Appraisal conversations: who was texted, who replied, what they
+            # said. The send happens inside GHL, so this is the only record of
+            # it. Best-effort — must never fail the store's data sync.
+            try:
+                from app.services.equity_messages import sync_equity_messages
+                tok = tokens.get(store["key"])
+                if tok and store["ghl_location_id"]:
+                    convs = await asyncio.to_thread(
+                        fetch_active_conversations, store["ghl_location_id"], tok, since_ms)
+                    ne = await sync_equity_messages(pg, store, convs, tok, tz)
+                    log(f"{store['name']:<32} appraisal threads={ne}")
+            except Exception as e:  # noqa: BLE001
+                log(f"equity messages skipped for {store['name']}: {e}")
             for n in range(days):
                 d = day_lo + timedelta(n)
                 await rollup(pg, store["id"], d)
@@ -718,6 +735,21 @@ async def run_ingest(days: int, log=print) -> list[dict]:
             log(f"{'classifier':<32} classified={nclass}")
     except Exception as e:  # noqa: BLE001 — never let classification break the sync
         log(f"classifier skipped: {e}")
+
+    # Drift audit: read each call's FULL transcript and judge it against the
+    # store script — the checks the post-call summary cannot support (greeting
+    # fired twice, goodbye mid-call, reasoning narrated aloud). Once per call,
+    # cached by message id. Writes rows only; NOTHING is alerted from here yet.
+    # Best-effort: an auditor hiccup must never fail the data sync.
+    try:
+        from app.services.esther_call_auditor import audit_unaudited, enabled as audit_enabled
+        if audit_enabled():
+            async with engine.begin() as conn:
+                pg = (await conn.get_raw_connection()).driver_connection
+                naudit = await audit_unaudited(pg, tokens, limit=40)
+            log(f"{'call_auditor':<32} audited={naudit}")
+    except Exception as e:  # noqa: BLE001 — never let the audit break the sync
+        log(f"call auditor skipped: {e}")
 
     # Secret Shopper: grade the QA (qa-line) shop calls with Claude — once per call,
     # cached by message id. Best-effort: a grader hiccup must never fail the sync.
