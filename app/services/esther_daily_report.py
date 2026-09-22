@@ -140,6 +140,20 @@ def _store_table(rows: list[dict]) -> str:
     return f'<table style="border-collapse:collapse;width:100%;margin-top:12px">{head}{body}</table>'
 
 
+def _store_sections(rows: list[dict]) -> str:
+    """Per-store detail blocks, stacked below the group summary so the whole
+    group reads as ONE email — scroll down to see each store one by one."""
+    out = ('<h3 style="margin:26px 0 2px;font-size:16px;color:#111827">By Store</h3>'
+           '<div style="color:#6b7280;font-size:12px;margin-bottom:6px">Each store\'s own numbers</div>')
+    for m in rows:
+        out += (
+            '<div style="margin-top:16px;padding-top:12px;border-top:1px solid #eef2f7">'
+            f'<div style="font-weight:700;font-size:14px;color:#111827;margin-bottom:8px">{m["store_name"]}</div>'
+            f'{_metric_cards(m)}</div>'
+        )
+    return out
+
+
 def _render_html(title: str, d: date_cls, cards: str, extra: str = "") -> str:
     return (
         f'<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:640px;margin:0 auto;color:#111827">'
@@ -182,6 +196,9 @@ async def build_report_payloads(pg, d: date_cls) -> list[dict]:
         "date": d.isoformat(),
         "subject": f"Esther Daily Report — All Stores — {d.isoformat()}",
         "metrics": group,
+        # ONE email for the whole group: summary cards + the all-stores table.
+        # (Per-store detail is available as separate payloads / a stacked section,
+        # kept off for now — Reid only wants the group email at this point.)
         "html": _render_html("Esther Daily Report — All Stores", d,
                              _metric_cards(group), _store_table(store_rows)),
     })
@@ -206,6 +223,13 @@ async def send_daily_reports(d: date_cls | None = None, webhook: str | None = No
     async with engine.begin() as conn:
         pg = (await conn.get_raw_connection()).driver_connection
         payloads = await build_report_payloads(pg, d)
+
+    # Default: send ONE combined email (the group payload already contains a
+    # per-store section for each store). Set ESTHER_DAILY_REPORT_PER_STORE=true to
+    # ALSO push the individual per-store payloads (separate emails per dealership).
+    include_per_store = os.getenv("ESTHER_DAILY_REPORT_PER_STORE", "").lower() in ("1", "true", "yes")
+    if not include_per_store:
+        payloads = [p for p in payloads if p["scope"] == "group"]
 
     if not webhook:
         log.warning("daily report: ESTHER_DAILY_REPORT_WEBHOOK not set — built %d reports, sent 0", len(payloads))
