@@ -52,6 +52,33 @@ async def _esther_autosync_loop(minutes: int):
         await asyncio.sleep(minutes * 60)
 
 
+async def _esther_daily_report_loop(hour: int):
+    """Once a day at `hour` America/Chicago, build the daily report and POST it to
+    the GHL inbound webhook (which emails it). Sleeps until the next occurrence;
+    a failed send is logged and retried the next day, never taking the server down."""
+    import asyncio as _asyncio
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    from app.services.esther_daily_report import send_daily_reports
+
+    ct = ZoneInfo("America/Chicago")
+    await _asyncio.sleep(25)  # let the web server finish booting
+    while True:
+        now = datetime.now(ct)
+        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await _asyncio.sleep(max(1, (target - now).total_seconds()))
+        try:
+            result = await send_daily_reports()
+            log.info("esther daily report: %s", result)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("esther daily report: send failed — will retry tomorrow")
+        await _asyncio.sleep(60)  # step off the target minute before recomputing
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if settings.auth_mode == "dev":
@@ -68,18 +95,24 @@ async def lifespan(app: FastAPI):
             await conn.run_sync(Base.metadata.create_all)
 
     autosync = None
+    daily_report = None
     if settings.esther_autosync_minutes > 0 and not settings.is_sqlite:
         log.info("esther autosync: enabled, every %s min", settings.esther_autosync_minutes)
         autosync = asyncio.create_task(_esther_autosync_loop(settings.esther_autosync_minutes))
+        if settings.esther_daily_report_hour >= 0:
+            log.info("esther daily report: enabled at %02d:00 CT", settings.esther_daily_report_hour)
+            daily_report = asyncio.create_task(
+                _esther_daily_report_loop(settings.esther_daily_report_hour))
 
     yield
 
-    if autosync:
-        autosync.cancel()
-        try:
-            await autosync
-        except asyncio.CancelledError:
-            pass
+    for task in (autosync, daily_report):
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(

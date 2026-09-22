@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     # that shouldn't sync). Set to 5 on the hosted backend.
     esther_autosync_minutes: int = 0
 
+    # Daily report: the backend builds the day's report at this hour (America/
+    # Chicago, 24h) and POSTs it to ESTHER_DAILY_REPORT_WEBHOOK (a GHL inbound
+    # webhook that emails it). 18 = 6 PM Central. Set to -1 to disable the loop.
+    esther_daily_report_hour: int = 18
+
     # Demo clock.  When set (ISO 8601), the app scores "now" against this instant
     # instead of the wall clock, so the demo board is alive at any hour and the
     # Match Scores are reproducible.  seed.py writes this. Leave empty in prod.
