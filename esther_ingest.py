@@ -825,6 +825,18 @@ async def run_ingest(days: int, log=print) -> list[dict]:
     except Exception as e:  # noqa: BLE001 — never let classification break the sync
         log(f"classifier skipped: {e}")
 
+    # Transfer reasons from the transcript — the summary rarely says WHY a call
+    # transferred, so this fills the "Unknown" bucket Reid needs for the roadmap.
+    try:
+        from app.services.esther_classifier import classify_transfer_reasons, enabled as cls_enabled2
+        if cls_enabled2():
+            async with engine.begin() as conn:
+                pg = (await conn.get_raw_connection()).driver_connection
+                nreason = await classify_transfer_reasons(pg, tokens, limit=60)
+            log(f"{'transfer_reason':<32} labeled={nreason}")
+    except Exception as e:  # noqa: BLE001 — never let it break the sync
+        log(f"transfer-reason skipped: {e}")
+
     # Drift audit: read each call's FULL transcript and judge it against the
     # store script — the checks the post-call summary cannot support (greeting
     # fired twice, goodbye mid-call, reasoning narrated aloud). Once per call,
