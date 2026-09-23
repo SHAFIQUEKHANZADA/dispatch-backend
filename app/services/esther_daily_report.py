@@ -1,5 +1,6 @@
 """Esther daily performance report — built server-side and pushed to a GHL
-inbound webhook once a day (6 PM Central by default). Reid asked for:
+inbound webhook once a day (9 PM Central by default — late enough to capture
+appointments booked after 6 PM). Reid asked for:
 
   * AI Resolution Rate (containment)
   * TWO conversion numbers: overall (booked / all calls) vs appointment-specific
