@@ -15,6 +15,7 @@ Run:  python esther_ingest.py [days]        # default 14
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -302,13 +303,57 @@ def fetch_active_conversations(loc: str, token: str, since_ms: int) -> list[dict
     return out
 
 
+# ── Reading the summary ───────────────────────────────────────────────────────
+# These patterns exist because a bare substring test on the summary sentence gets
+# the answer backwards on a tenth of all calls. Measured over 14 days:
+#   "booked"     matched 102 of 1057 summaries that say the appointment was NOT booked
+#                ("transferred to voicemail, no appointment booked")
+#   "call back"  matched summaries where the CUSTOMER is ringing US, which is not a
+#                callback the store owes anyone ("declined 4:30 PM, said she would
+#                call back")
+# The AI node already decides all of this correctly — we just could not read it.
+
+# The appointment did NOT happen, whatever the rest of the sentence says.
+_NO_BOOKING = re.compile(
+    r"no appointment|no booking|not booked|never booked|without (an? )?appointment",
+    re.I)
+
+# Someone AT THE STORE committed to ringing the customer, so the store already owns
+# the next action. Checked BEFORE _SELF_CALLBACK, because "human said they would call
+# back" contains "they would call back" and would otherwise read as the customer.
+# The [^,.;] window keeps the role word as the actual subject — without it,
+# "human canceled it, caller will call back" reads as owned.
+_OWNED_CALLBACK = re.compile(
+    r"promised[^.]{0,40}call(ing)?\s*back"
+    r"|callback\s+promised"
+    r"|promised\s+(a\s+|an\s+)?callback"
+    r"|\b(human|employee|adviser|advisor|manager|team|department|representative|rep"
+    r"|technician|tech|service)\b[^,.;]{0,20}(will|would)\s+call\s+back"
+    r"|\b(will|would)\s+(contact|call)\s+(you|them|the customer)\b",
+    re.I)
+
+# The CUSTOMER said they would ring us. Nothing is owed and nobody should be alerted.
+_SELF_CALLBACK = re.compile(
+    r"\b(caller|customer|she|he|they)\s+(said\s+)?(would|will)\s+call\s+back"
+    r"|\bsaid\s+(she\s+|he\s+|they\s+)?would\s+call\s+back"
+    r"|\bwill\s+call\s+back\s+(later|when|to\s+schedule)",
+    re.I)
+
+
 def classify_summary(text: str | None) -> dict:
     """Per-call outcome from Esther's post-call summary comment. Event-based, so it
     does NOT over-count returning callers the way sticky contact tags do."""
     t = (text or "").lower()
     transferred = "transfer" in t
-    callback = "callback" in t or "call back" in t
-    booked = "booked" in t or "appointment confirmed" in t or "scheduled service" in t
+
+    owned = bool(_OWNED_CALLBACK.search(t))
+    # Owned wins: a named employee promising to ring back is the store's callback,
+    # never the customer's.
+    self_only = bool(_SELF_CALLBACK.search(t)) and not owned
+    callback = ("callback" in t or "call back" in t) and not self_only
+
+    booked = (("booked" in t or "appointment confirmed" in t or "scheduled service" in t)
+              and not _NO_BOOKING.search(t))
     dropped = any(w in t for w in (
         "voicemail", "unresolved", "no resolution", "dropped", "no appointment",
         "hung up", "disconnected", "abandoned",
@@ -323,7 +368,14 @@ def classify_summary(text: str | None) -> dict:
         outcome = "info_only"
     else:
         outcome = None  # no summary yet (call just happened / not classified)
-    return {"outcome": outcome, "transferred": transferred, "callback_needed": callback}
+    return {
+        "outcome": outcome,
+        "transferred": transferred,
+        "callback_needed": callback,
+        # True only when the callback is one the store already has. The dashboard
+        # splits on this: a callback with an owner is reporting, one without is work.
+        "callback_owned": callback and owned,
+    }
 
 
 def fetch_call_events(client: httpx.Client, conv_id: str, token: str, since_ms: int,
@@ -434,6 +486,7 @@ async def build_call_rows(store: dict, since_ms: int, tokens: dict[str, str]) ->
             "transferred": call["transferred"],
             "transfer_succeeded": None,
             "callback_needed": call["callback_needed"],
+            "callback_owned": call.get("callback_owned"),
             "needs_attention": d.get("needs_attention", False),
             "tags": d.get("tags", []),
             "summary": call.get("summary"),  # stored so the classifier can read it
@@ -457,6 +510,7 @@ async def sync_calls(pg, store: dict, since_ms: int, tokens: dict[str, str]) -> 
             r["started_at"], r["local_date"], r["direction"], r["department"], r["outcome"],
             r["intent"], r["transferred"], r["transfer_succeeded"], r["callback_needed"],
             r["needs_attention"], r["tags"], r["summary"], r["duration_sec"],
+            r["callback_owned"],
         )
         for r in rows
     ]
@@ -466,12 +520,13 @@ async def sync_calls(pg, store: dict, since_ms: int, tokens: dict[str, str]) -> 
           (store_id, ghl_conversation_id, ghl_contact_id, ghl_message_id, started_at,
            local_date, direction, department, outcome, intent, transferred,
            transfer_succeeded, callback_needed, needs_attention, tags, summary,
-           duration_sec)
-        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+           duration_sec, callback_owned)
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
         on conflict (ghl_message_id) do update set
            outcome=excluded.outcome, intent=excluded.intent, department=excluded.department,
            transferred=excluded.transferred, transfer_succeeded=excluded.transfer_succeeded,
-           callback_needed=excluded.callback_needed, needs_attention=excluded.needs_attention,
+           callback_needed=excluded.callback_needed, callback_owned=excluded.callback_owned,
+           needs_attention=excluded.needs_attention,
            tags=excluded.tags, started_at=excluded.started_at, summary=excluded.summary,
            duration_sec=coalesce(excluded.duration_sec, esther_calls.duration_sec)
         """,
@@ -610,7 +665,8 @@ async def rollup(pg, store_id, date: str, per_call: bool = False) -> None:
         insert into esther_daily_metrics as dm
           (store_id, local_date, total_calls, appointments_booked, eligible_calls, booking_pct,
            booking_attempts,
-           transfers, failed_transfers, dropped_calls, callbacks_needed, recovered_count,
+           transfers, failed_transfers, dropped_calls, callbacks_needed, callbacks_unowned,
+           recovered_count,
            contained_calls, containment_rate,
            intent_breakdown, ai_spend, cost_per_booking, updated_at)
         select
@@ -638,6 +694,12 @@ async def rollup(pg, store_id, date: str, per_call: bool = False) -> None:
           (select count(*) from c where transferred and transfer_succeeded is false and department is distinct from 'sales'),
           (select count(*) from c where outcome='dropped'),
           (select count(distinct ghl_contact_id) from c where callback_needed),
+          -- Callbacks NOBODY has. callbacks_needed above counts every callback owed,
+          -- including the ones an employee on the call promised to make; those are
+          -- reporting, not work. This is the number that should match the texts the
+          -- alert workflow sends, so the dashboard and Reid's phone agree.
+          (select count(distinct ghl_contact_id) from c
+             where callback_needed and callback_owned is not true),
           -- recovered: an at-risk contact (dropped / callback-needed / needs-attention)
           -- that ultimately booked. Detected from the tags we already store.
           (select count(distinct ghl_contact_id) from c where outcome='booked'
@@ -665,6 +727,7 @@ async def rollup(pg, store_id, date: str, per_call: bool = False) -> None:
           booking_attempts=excluded.booking_attempts,
           transfers=excluded.transfers, failed_transfers=excluded.failed_transfers,
           dropped_calls=excluded.dropped_calls, callbacks_needed=excluded.callbacks_needed,
+          callbacks_unowned=excluded.callbacks_unowned,
           recovered_count=excluded.recovered_count,
           contained_calls=excluded.contained_calls, containment_rate=excluded.containment_rate,
           intent_breakdown=excluded.intent_breakdown,
