@@ -44,9 +44,11 @@ class Settings(BaseSettings):
 
     # Daily report: the backend builds the day's report at this hour (America/
     # Chicago, 24h) and POSTs it to ESTHER_DAILY_REPORT_WEBHOOK (a GHL inbound
-    # webhook that emails it). 21 = 9 PM Central — late enough to capture the
-    # appointments booked after 6 PM (Reid). Set to -1 to disable the loop.
-    esther_daily_report_hour: int = 21
+    # webhook that emails it). 23 = 11 PM Central — captures the FULL day incl.
+    # appointments booked after 6 PM (Reid), while still reporting today's date.
+    # Don't use 0 (midnight): the date has rolled over, so the report is empty.
+    # Set to -1 to disable the loop.
+    esther_daily_report_hour: int = 23
 
     # Demo clock.  When set (ISO 8601), the app scores "now" against this instant
     # instead of the wall clock, so the demo board is alive at any hour and the
