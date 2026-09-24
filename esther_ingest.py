@@ -672,7 +672,12 @@ async def rollup(pg, store_id, date: str, per_call: bool = False) -> None:
         select
           $1, $2,
           (select count(*) from c),
-          (select count(distinct ghl_contact_id) from c where outcome='booked'),
+          -- Appointments Booked counts APPOINTMENTS (each booked call), not distinct
+          -- callers: one customer who books two appointments (e.g. a recall + an oil
+          -- change, or a reschedule) is two appointments on the books. count(*) here
+          -- is per booked call row (deduped on ghl_message_id at insert), so it matches
+          -- a hand count of the "Booked ..." summaries in the GHL inbox.
+          (select count(*) from c where outcome='booked'),
           (select count(distinct ghl_contact_id) from c where department in ('service','sales') and coalesce(outcome,'')<>'no_transcript'),
           -- Conversion = bookings AMONG eligible calls ÷ eligible calls. Numerator and
           -- denominator must share the same population (service/sales, non no_transcript),
@@ -685,7 +690,9 @@ async def rollup(pg, store_id, date: str, per_call: bool = False) -> None:
           -- Booking attempts = calls that reached a booking DECISION (booked /
           -- callback-needed / dropped). Denominator for appointment-specific
           -- conversion (booked ÷ attempts ≈ 80%); excludes pure-info calls.
-          (select count(distinct ghl_contact_id) from c
+          -- Event-based (count(*)) to stay consistent with appointments_booked
+          -- above, so the ratio is appointments ÷ attempt-calls, not mixed units.
+          (select count(*) from c
              where outcome in ('booked','callback_needed','dropped')),
           -- Transfers shown on the dashboard are SERVICE transfers only (Reid's ask):
           -- Esther is the service line, so sales hand-offs are excluded. Unclassified
@@ -717,8 +724,10 @@ async def rollup(pg, store_id, date: str, per_call: bool = False) -> None:
                else null end,
           coalesce((select jsonb_object_agg(k, n) from intent), '{}'::jsonb),
           (select spend from sp),
-          case when (select spend from sp) is not null and (select count(distinct ghl_contact_id) from c where outcome='booked') > 0
-               then round((select spend from sp) / (select count(distinct ghl_contact_id) from c where outcome='booked'), 2)
+          -- Cost per booking divides spend by APPOINTMENTS (count(*) booked),
+          -- matching appointments_booked above so the card's "spend ÷ bookings" holds.
+          case when (select spend from sp) is not null and (select count(*) from c where outcome='booked') > 0
+               then round((select spend from sp) / (select count(*) from c where outcome='booked'), 2)
                else null end,
           now()
         on conflict (store_id, local_date) do update set
