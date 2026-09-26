@@ -84,6 +84,8 @@ async def _store_row(pg, store: dict, d: date_cls) -> dict:
         "ai_resolution_rate": _pct(contained, eligible),
         "conversion_overall": _pct(booked, total),
         "conversion_appointment": _pct(booked, attempts),
+        # Share of all calls that were transferred to a person (service transfers).
+        "transfer_pct": _pct(transfers, total),
     }
 
 
@@ -99,15 +101,16 @@ def _metric_cards(m: dict) -> str:
     aiRes = "—" if m["ai_resolution_rate"] is None else f'{m["ai_resolution_rate"]}%'
     ov = "—" if m["conversion_overall"] is None else f'{m["conversion_overall"]}%'
     ap = "—" if m["conversion_appointment"] is None else f'{m["conversion_appointment"]}%'
+    tpct = "" if m.get("transfer_pct") is None else f'{m["transfer_pct"]}% of calls'
     return (
         '<table cellspacing="8" cellpadding="0" style="border-collapse:separate;width:100%"><tr>'
         + card("Total Calls", m["total_calls"])
         + card("Appointments Booked", m["appointments_booked"])
-        + card("AI Resolution Rate", aiRes, "handled by Esther")
+        + card("AI Resolution Rate", aiRes, "booked + info + correct transfers ÷ eligible")
         + "</tr><tr>"
         + card("Conversion — Overall", ov, "booked ÷ all calls")
         + card("Conversion — Appointment", ap, "booked ÷ booking attempts")
-        + card("Service Transfers", m["transfers"])
+        + card("Service Transfers", m["transfers"], tpct)
         + "</tr></table>"
     )
 
@@ -119,7 +122,7 @@ def _store_table(rows: list[dict]) -> str:
             f'<th style="text-align:{a};padding:8px 10px;font-size:12px;color:#6b7280;border-bottom:1px solid #e5e7eb">{h}</th>'
             for h, a in [("Store", "left"), ("Calls", "right"), ("Booked", "right"),
                          ("AI Res.", "right"), ("Overall", "right"), ("Appt %", "right"),
-                         ("Transfers", "right")]
+                         ("Transfers", "right"), ("Transfer %", "right")]
         )
         + "</tr>"
     )
@@ -133,12 +136,43 @@ def _store_table(rows: list[dict]) -> str:
             ("—" if m["conversion_overall"] is None else f'{m["conversion_overall"]}%', "right"),
             ("—" if m["conversion_appointment"] is None else f'{m["conversion_appointment"]}%', "right"),
             (str(m["transfers"]), "right"),
+            ("—" if m.get("transfer_pct") is None else f'{m["transfer_pct"]}%', "right"),
         ]
         body += "<tr>" + "".join(
             f'<td style="text-align:{a};padding:8px 10px;font-size:13px;color:#111827;border-bottom:1px solid #f3f4f6">{v}</td>'
             for v, a in cells
         ) + "</tr>"
     return f'<table style="border-collapse:collapse;width:100%;margin-top:12px">{head}{body}</table>'
+
+
+def _legend() -> str:
+    """Plain-English definitions so nobody has to guess what a metric counts —
+    especially AI Resolution, which is a blend of three good outcomes."""
+    items = [
+        ("AI Resolution Rate",
+         "Share of eligible calls Esther handled without a person having to step in. "
+         "Counts three outcomes as resolved: (1) an appointment was booked, (2) an "
+         "information-only question was answered, or (3) the call was correctly "
+         "transferred to the right person. Denominator = eligible calls "
+         "(service/sales calls that had a transcript)."),
+        ("Conversion — Overall", "Appointments booked ÷ all calls."),
+        ("Conversion — Appointment",
+         "Appointments booked ÷ booking attempts (calls where the caller was actually "
+         "trying to book — excludes pure info calls)."),
+        ("Transfers", "Number of calls Esther transferred to a person (service transfers)."),
+        ("Transfer %", "Service transfers ÷ all calls — the share of calls that needed a person."),
+    ]
+    rows = "".join(
+        f'<div style="margin-bottom:6px"><span style="font-weight:700;color:#111827">{k}:</span> '
+        f'<span style="color:#4b5563">{v}</span></div>'
+        for k, v in items
+    )
+    return (
+        '<div style="margin-top:18px;padding:12px 14px;background:#f9fafb;border:1px solid #e5e7eb;'
+        'border-radius:10px;font-size:12px;line-height:1.5">'
+        '<div style="font-weight:800;color:#111827;margin-bottom:6px">What these mean</div>'
+        f'{rows}</div>'
+    )
 
 
 def _store_sections(rows: list[dict]) -> str:
@@ -187,6 +221,7 @@ async def build_report_payloads(pg, d: date_cls) -> list[dict]:
         "ai_resolution_rate": _pct(g_contained, g_elig),
         "conversion_overall": _pct(g_booked, g_total),
         "conversion_appointment": _pct(g_booked, g_attempts),
+        "transfer_pct": _pct(g_transfers, g_total),
     }
 
     payloads: list[dict] = []
@@ -201,7 +236,7 @@ async def build_report_payloads(pg, d: date_cls) -> list[dict]:
         # (Per-store detail is available as separate payloads / a stacked section,
         # kept off for now — Reid only wants the group email at this point.)
         "html": _render_html("Esther Daily Report — All Stores", d,
-                             _metric_cards(group), _store_table(store_rows)),
+                             _metric_cards(group), _store_table(store_rows) + _legend()),
     })
     for r in store_rows:
         payloads.append({
@@ -211,7 +246,7 @@ async def build_report_payloads(pg, d: date_cls) -> list[dict]:
             "date": d.isoformat(),
             "subject": f"Esther Daily Report — {r['store_name']} — {d.isoformat()}",
             "metrics": r,
-            "html": _render_html(f"Esther Daily Report — {r['store_name']}", d, _metric_cards(r)),
+            "html": _render_html(f"Esther Daily Report — {r['store_name']}", d, _metric_cards(r) + _legend()),
         })
     return payloads
 
