@@ -135,14 +135,22 @@ def _metric_cards(m: dict) -> str:
     ov = "—" if m["conversion_overall"] is None else f'{m["conversion_overall"]}%'
     ap = "—" if m["conversion_appointment"] is None else f'{m["conversion_appointment"]}%'
     tpct = "" if m.get("transfer_pct") is None else f'{m["transfer_pct"]}% of calls'
+    intent = m.get("booking_attempts", 0)
+    qa = m.get("o_info", 0)
+    # Row 1 is the funnel in order — Calls -> Appt Intent -> Booked -> Questions
+    # Answered — so the denominators are visible (Chris: "a column between Calls and
+    # Booked for Appt Intent... that is what Appt% is based on") and info calls read
+    # as their own success. Row 2 is the rates + transfers.
     return (
         '<table cellspacing="8" cellpadding="0" style="border-collapse:separate;width:100%"><tr>'
         + card("Total Calls", m["total_calls"])
+        + card("Appt Intent", intent, "callers trying to book")
         + card("Appointments Booked", m["appointments_booked"])
-        + card("AI Resolution Rate", aiRes, "booked + info + correct transfers ÷ eligible")
+        + card("Questions Answered", qa, "info handled by Esther")
         + "</tr><tr>"
+        + card("AI Resolution Rate", aiRes, "booked + info + correct transfers ÷ eligible")
         + card("Conversion — Overall", ov, "booked ÷ all calls")
-        + card("Conversion — Appointment", ap, "booked ÷ booking attempts")
+        + card("Conversion — Appointment", ap, "booked ÷ Appt Intent")
         + card("Service Transfers", m["transfers"], tpct)
         + "</tr></table>"
     )
@@ -152,8 +160,10 @@ def _store_table(rows: list[dict]) -> str:
     head = (
         '<tr style="background:#f9fafb">'
         + "".join(
-            f'<th style="text-align:{a};padding:8px 10px;font-size:12px;color:#6b7280;border-bottom:1px solid #e5e7eb">{h}</th>'
-            for h, a in [("Store", "left"), ("Calls", "right"), ("Booked", "right"),
+            f'<th style="text-align:{a};padding:7px 8px;font-size:11px;color:#6b7280;border-bottom:1px solid #e5e7eb">{h}</th>'
+            # Appt Intent sits between Calls and Booked (Chris); Q Ans = questions answered.
+            for h, a in [("Store", "left"), ("Calls", "right"), ("Appt Intent", "right"),
+                         ("Booked", "right"), ("Q Ans", "right"),
                          ("AI Res.", "right"), ("Overall", "right"), ("Appt %", "right"),
                          ("Transfers", "right"), ("Transfer %", "right")]
         )
@@ -164,7 +174,9 @@ def _store_table(rows: list[dict]) -> str:
         cells = [
             (m["store_name"], "left"),
             (str(m["total_calls"]), "right"),
+            (str(m.get("booking_attempts", 0)), "right"),
             (str(m["appointments_booked"]), "right"),
+            (str(m.get("o_info", 0)), "right"),
             ("—" if m["ai_resolution_rate"] is None else f'{m["ai_resolution_rate"]}%', "right"),
             ("—" if m["conversion_overall"] is None else f'{m["conversion_overall"]}%', "right"),
             ("—" if m["conversion_appointment"] is None else f'{m["conversion_appointment"]}%', "right"),
@@ -172,37 +184,46 @@ def _store_table(rows: list[dict]) -> str:
             ("—" if m.get("transfer_pct") is None else f'{m["transfer_pct"]}%', "right"),
         ]
         body += "<tr>" + "".join(
-            f'<td style="text-align:{a};padding:8px 10px;font-size:13px;color:#111827;border-bottom:1px solid #f3f4f6">{v}</td>'
+            f'<td style="text-align:{a};padding:7px 8px;font-size:12px;color:#111827;border-bottom:1px solid #f3f4f6">{v}</td>'
             for v, a in cells
         ) + "</tr>"
     return f'<table style="border-collapse:collapse;width:100%;margin-top:12px">{head}{body}</table>'
 
 
 def _breakdown(m: dict) -> str:
-    """"Where every call went" — a chip row whose numbers add up to Total Calls, so
-    the report answers "what happened to the rest of the calls" on its own, with no
-    follow-up explanation. Transfers is shown as an overlay (a tag on the call), not
-    a bucket, so nobody tries to subtract it from the total."""
+    """"Where every call went" — chips that add up to Total Calls, grouped into
+    HANDLED (a success — booked OR a question answered) vs NEEDS FOLLOW-UP, so a
+    question Esther answered counts as a win in its own category (Chris) and the
+    report explains itself with no follow-up. Transfers is shown as an overlay tag,
+    not a bucket, so nobody subtracts it from the total."""
     total = m["total_calls"]
-    parts = [
-        ("Booked", m["o_booked"]),
-        ("Dropped", m["o_dropped"]),
-        ("Info-only", m["o_info"]),
-        ("Callbacks", m["o_callback"]),
-        ("No summary", m["o_other"]),
-    ]
-    chips = "".join(
-        f'<span style="display:inline-block;margin:2px 8px 2px 0;padding:4px 10px;border-radius:999px;'
-        f'background:#f3f4f6;font-size:12px;color:#374151">'
-        f'<b style="color:#111827">{n}</b> {label}</span>'
-        for label, n in parts
-    )
+
+    def chip(label, n, tone):
+        bg, fg, strong = {
+            "good": ("#ecfdf5", "#047857", "#065f46"),
+            "warn": ("#fff7ed", "#b45309", "#9a3412"),
+            "muted": ("#f3f4f6", "#4b5563", "#111827"),
+        }[tone]
+        return (
+            f'<span style="display:inline-block;margin:2px 8px 2px 0;padding:4px 10px;border-radius:999px;'
+            f'background:{bg};font-size:12px;color:{fg}"><b style="color:{strong}">{n}</b> {label}</span>'
+        )
+
+    def heading(text, color):
+        return (f'<div style="font-size:11px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;'
+                f'color:{color};margin:10px 0 3px">{text}</div>')
+
+    handled = chip("Booked", m["o_booked"], "good") + chip("Questions answered", m["o_info"], "good")
+    followup = chip("Dropped", m["o_dropped"], "warn") + chip("Callbacks", m["o_callback"], "warn")
+    if m["o_other"]:
+        followup += chip("No summary", m["o_other"], "muted")
+
     note = ""
     if m.get("transfers"):
         vm = m.get("transfers_voicemail") or 0
         vmtxt = f", {vm} of which reached voicemail" if vm else ""
         note = (
-            '<div style="font-size:12px;color:#6b7280;margin-top:8px">'
+            '<div style="font-size:12px;color:#6b7280;margin-top:10px">'
             f'{m["transfers"]} of these {total} calls were also transferred to a person{vmtxt}. '
             'A transfer is a tag on a call, not a separate call — that is why it overlaps the '
             'outcomes above instead of adding to them.'
@@ -210,8 +231,10 @@ def _breakdown(m: dict) -> str:
         )
     return (
         '<div style="margin-top:16px;padding:12px 14px;background:#fff;border:1px solid #e5e7eb;border-radius:10px">'
-        f'<div style="font-size:13px;font-weight:800;color:#111827;margin-bottom:8px">Where the {total} calls went</div>'
-        f'<div>{chips}</div>{note}</div>'
+        f'<div style="font-size:13px;font-weight:800;color:#111827">Where the {total} calls went</div>'
+        + heading("Handled", "#047857") + f'<div>{handled}</div>'
+        + heading("Needs follow-up", "#b45309") + f'<div>{followup}</div>'
+        + note + '</div>'
     )
 
 
@@ -262,6 +285,7 @@ async def build_report_payloads(pg, d: date_cls) -> list[dict]:
         "conversion_overall": _pct(g_booked, g_total),
         "conversion_appointment": _pct(g_booked, g_attempts),
         "transfer_pct": _pct(g_transfers, g_total),
+        "booking_attempts": g_attempts,
         "o_booked": sum(r["o_booked"] for r in store_rows),
         "o_dropped": sum(r["o_dropped"] for r in store_rows),
         "o_callback": sum(r["o_callback"] for r in store_rows),
