@@ -40,12 +40,9 @@ def _pct(n: float | int, d: float | int) -> float | None:
 async def _store_row(pg, store: dict, d: date_cls) -> dict:
     """Metrics for one store-day. Reads the settled figures from the rollup and
     computes the appointment-specific denominator (booking attempts) live."""
-    per_call = store["key"] in PER_CALL_STORE_KEYS
-    dk = "ghl_message_id" if per_call else "ghl_contact_id"
-
     dm = await pg.fetchrow(
         """select total_calls, appointments_booked, eligible_calls, contained_calls,
-                  transfers, ai_spend
+                  transfers, ai_spend, booking_attempts
            from esther_daily_metrics where store_id=$1 and local_date=$2""",
         store["id"], d,
     )
@@ -55,17 +52,22 @@ async def _store_row(pg, store: dict, d: date_cls) -> dict:
     contained = (dm["contained_calls"] if dm else 0) or 0
     transfers = (dm["transfers"] if dm else 0) or 0
 
-    # Booking attempts = calls where the customer reached a booking DECISION
-    # (booked / needed a callback / dropped). Excludes pure info & no-transcript
-    # calls — people who weren't trying to book. This is Reid's "appointment
-    # specific" denominator; booked / attempts is the ~80%.
-    attempts = await pg.fetchval(
-        f"""select count(distinct {dk}) from esther_calls
-            where store_id=$1 and local_date=$2
-              and (tags is null or not (tags @> array['qa-line']))
-              and outcome in ('booked','callback_needed','dropped')""",
-        store["id"], d,
-    ) or 0
+    # Appt Intent (booking attempts) = calls where the customer reached a booking
+    # DECISION (booked / needed a callback / dropped). Excludes pure info &
+    # no-transcript calls — people who weren't trying to book. Read the EVENT-based
+    # value straight from the rollup so it shares the same basis as appointments_booked
+    # (also events) and matches the dashboard exactly — booked ÷ attempts is then a
+    # clean like-for-like ratio, not events over distinct callers. Falls back to a
+    # live event count only when the rollup hasn't populated the column yet.
+    attempts = dm["booking_attempts"] if dm else None
+    if attempts is None:
+        attempts = await pg.fetchval(
+            """select count(*) from esther_calls
+                where store_id=$1 and local_date=$2
+                  and (tags is null or not (tags @> array['qa-line']))
+                  and outcome in ('booked','callback_needed','dropped')""",
+            store["id"], d,
+        ) or 0
     recovered = await pg.fetchval(
         "select coalesce(sum(value),0) from esther_recovered_opportunities where store_id=$1 and local_date=$2",
         store["id"], d,
