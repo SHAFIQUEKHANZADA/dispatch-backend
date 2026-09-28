@@ -71,6 +71,32 @@ async def _store_row(pg, store: dict, d: date_cls) -> dict:
         store["id"], d,
     ) or 0
 
+    # Outcome breakdown — where every call went. Same population as total_calls
+    # (excludes qa-line test calls), so booked + dropped + info + callbacks + other
+    # sums to Total Calls exactly. This is the "makes sense at a glance" answer to
+    # "what happened to the rest of the calls" (Reid) — nothing left to explain.
+    oc = await pg.fetch(
+        """select coalesce(outcome,'no_summary') o, count(*) n from esther_calls
+             where store_id=$1 and local_date=$2
+               and (tags is null or not (tags @> array['qa-line']))
+             group by 1""",
+        store["id"], d,
+    )
+    om = {r["o"]: r["n"] for r in oc}
+    o_booked = om.get("booked", 0)
+    o_dropped = om.get("dropped", 0)
+    o_callback = om.get("callback_needed", 0)
+    o_info = om.get("info_only", 0)
+    o_other = max(0, total - (o_booked + o_dropped + o_callback + o_info))  # no-summary / no-transcript
+    # transfers that ended in voicemail (a transfer AND a drop) — explains the overlap.
+    transfers_voicemail = await pg.fetchval(
+        """select count(*) from esther_calls
+             where store_id=$1 and local_date=$2
+               and (tags is null or not (tags @> array['qa-line']))
+               and transferred and department is distinct from 'sales' and outcome='dropped'""",
+        store["id"], d,
+    ) or 0
+
     return {
         "store_key": store["key"],
         "store_name": store["name"],
@@ -86,6 +112,13 @@ async def _store_row(pg, store: dict, d: date_cls) -> dict:
         "conversion_appointment": _pct(booked, attempts),
         # Share of all calls that were transferred to a person (service transfers).
         "transfer_pct": _pct(transfers, total),
+        # Outcome breakdown (sums to total_calls) + the transfer→voicemail overlap.
+        "o_booked": o_booked,
+        "o_dropped": o_dropped,
+        "o_callback": o_callback,
+        "o_info": o_info,
+        "o_other": o_other,
+        "transfers_voicemail": transfers_voicemail,
     }
 
 
@@ -145,33 +178,40 @@ def _store_table(rows: list[dict]) -> str:
     return f'<table style="border-collapse:collapse;width:100%;margin-top:12px">{head}{body}</table>'
 
 
-def _legend() -> str:
-    """Plain-English definitions so nobody has to guess what a metric counts —
-    especially AI Resolution, which is a blend of three good outcomes."""
-    items = [
-        ("AI Resolution Rate",
-         "Share of eligible calls Esther handled without a person having to step in. "
-         "Counts three outcomes as resolved: (1) an appointment was booked, (2) an "
-         "information-only question was answered, or (3) the call was correctly "
-         "transferred to the right person. Denominator = eligible calls "
-         "(service/sales calls that had a transcript)."),
-        ("Conversion — Overall", "Appointments booked ÷ all calls."),
-        ("Conversion — Appointment",
-         "Appointments booked ÷ booking attempts (calls where the caller was actually "
-         "trying to book — excludes pure info calls)."),
-        ("Transfers", "Number of calls Esther transferred to a person (service transfers)."),
-        ("Transfer %", "Service transfers ÷ all calls — the share of calls that needed a person."),
+def _breakdown(m: dict) -> str:
+    """"Where every call went" — a chip row whose numbers add up to Total Calls, so
+    the report answers "what happened to the rest of the calls" on its own, with no
+    follow-up explanation. Transfers is shown as an overlay (a tag on the call), not
+    a bucket, so nobody tries to subtract it from the total."""
+    total = m["total_calls"]
+    parts = [
+        ("Booked", m["o_booked"]),
+        ("Dropped", m["o_dropped"]),
+        ("Info-only", m["o_info"]),
+        ("Callbacks", m["o_callback"]),
+        ("No summary", m["o_other"]),
     ]
-    rows = "".join(
-        f'<div style="margin-bottom:6px"><span style="font-weight:700;color:#111827">{k}:</span> '
-        f'<span style="color:#4b5563">{v}</span></div>'
-        for k, v in items
+    chips = "".join(
+        f'<span style="display:inline-block;margin:2px 8px 2px 0;padding:4px 10px;border-radius:999px;'
+        f'background:#f3f4f6;font-size:12px;color:#374151">'
+        f'<b style="color:#111827">{n}</b> {label}</span>'
+        for label, n in parts
     )
+    note = ""
+    if m.get("transfers"):
+        vm = m.get("transfers_voicemail") or 0
+        vmtxt = f", {vm} of which reached voicemail" if vm else ""
+        note = (
+            '<div style="font-size:12px;color:#6b7280;margin-top:8px">'
+            f'{m["transfers"]} of these {total} calls were also transferred to a person{vmtxt}. '
+            'A transfer is a tag on a call, not a separate call — that is why it overlaps the '
+            'outcomes above instead of adding to them.'
+            '</div>'
+        )
     return (
-        '<div style="margin-top:18px;padding:12px 14px;background:#f9fafb;border:1px solid #e5e7eb;'
-        'border-radius:10px;font-size:12px;line-height:1.5">'
-        '<div style="font-weight:800;color:#111827;margin-bottom:6px">What these mean</div>'
-        f'{rows}</div>'
+        '<div style="margin-top:16px;padding:12px 14px;background:#fff;border:1px solid #e5e7eb;border-radius:10px">'
+        f'<div style="font-size:13px;font-weight:800;color:#111827;margin-bottom:8px">Where the {total} calls went</div>'
+        f'<div>{chips}</div>{note}</div>'
     )
 
 
@@ -222,6 +262,12 @@ async def build_report_payloads(pg, d: date_cls) -> list[dict]:
         "conversion_overall": _pct(g_booked, g_total),
         "conversion_appointment": _pct(g_booked, g_attempts),
         "transfer_pct": _pct(g_transfers, g_total),
+        "o_booked": sum(r["o_booked"] for r in store_rows),
+        "o_dropped": sum(r["o_dropped"] for r in store_rows),
+        "o_callback": sum(r["o_callback"] for r in store_rows),
+        "o_info": sum(r["o_info"] for r in store_rows),
+        "o_other": sum(r["o_other"] for r in store_rows),
+        "transfers_voicemail": sum(r["transfers_voicemail"] for r in store_rows),
     }
 
     payloads: list[dict] = []
@@ -236,7 +282,7 @@ async def build_report_payloads(pg, d: date_cls) -> list[dict]:
         # (Per-store detail is available as separate payloads / a stacked section,
         # kept off for now — Reid only wants the group email at this point.)
         "html": _render_html("Esther Daily Report — All Stores", d,
-                             _metric_cards(group), _store_table(store_rows) + _legend()),
+                             _metric_cards(group), _breakdown(group) + _store_table(store_rows)),
     })
     for r in store_rows:
         payloads.append({
@@ -246,7 +292,7 @@ async def build_report_payloads(pg, d: date_cls) -> list[dict]:
             "date": d.isoformat(),
             "subject": f"Esther Daily Report — {r['store_name']} — {d.isoformat()}",
             "metrics": r,
-            "html": _render_html(f"Esther Daily Report — {r['store_name']}", d, _metric_cards(r) + _legend()),
+            "html": _render_html(f"Esther Daily Report — {r['store_name']}", d, _metric_cards(r) + _breakdown(r)),
         })
     return payloads
 
