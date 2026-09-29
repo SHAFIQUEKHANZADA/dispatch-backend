@@ -162,7 +162,10 @@ def _store_table(rows: list[dict]) -> str:
     head = (
         '<tr style="background:#f9fafb">'
         + "".join(
-            f'<th style="text-align:{a};padding:7px 8px;font-size:11px;color:#6b7280;border-bottom:1px solid #e5e7eb">{h}</th>'
+            # white-space:nowrap so a header never breaks mid-word ("Call s",
+            # "Transfe rs") when the column is tight; a smaller 10px header keeps
+            # all 10 columns inside the 640px email width (Reid — headers spilling).
+            f'<th style="text-align:{a};white-space:nowrap;padding:6px 6px;font-size:10px;color:#6b7280;border-bottom:1px solid #e5e7eb">{h}</th>'
             # Appt Intent sits between Calls and Booked (Chris); Q Ans = questions answered.
             for h, a in [("Store", "left"), ("Calls", "right"), ("Appt Intent", "right"),
                          ("Booked", "right"), ("Q Ans", "right"),
@@ -186,7 +189,8 @@ def _store_table(rows: list[dict]) -> str:
             ("—" if m.get("transfer_pct") is None else f'{m["transfer_pct"]}%', "right"),
         ]
         body += "<tr>" + "".join(
-            f'<td style="text-align:{a};padding:7px 8px;font-size:12px;color:#111827;border-bottom:1px solid #f3f4f6">{v}</td>'
+            # numbers never wrap ("94.2 %"); only the left-aligned store name wraps.
+            f'<td style="text-align:{a};{"white-space:nowrap;" if a == "right" else ""}padding:6px 6px;font-size:12px;color:#111827;border-bottom:1px solid #f3f4f6">{v}</td>'
             for v, a in cells
         ) + "</tr>"
     return f'<table style="border-collapse:collapse;width:100%;margin-top:12px">{head}{body}</table>'
