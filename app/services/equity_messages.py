@@ -43,6 +43,11 @@ _SEE_OPTIONS = re.compile(r"actively looking for vehicles like yours", re.I)
 _CONFIRM = re.compile(r"come find you in the lounge", re.I)
 _DECLINE = re.compile(r"we'll see you at your service appointment", re.I)
 _VALUE_ONLY = re.compile(r"have that number ready for you", re.I)
+# Newer, simpler appraisal flow (Kia + Elgin, and any store on the updated
+# script): the customer says they HAVEN'T been appraised → that's the opportunity,
+# and the connector replies with the acquisition-team hand-off. The presence of
+# that line IS the "yes", the same way _CONFIRM is for the original flow.
+_ACQUISITION = re.compile(r"acquisition team will be with you", re.I)
 _STOP = re.compile(r"^\s*(stop|stopall|unsubscribe|end|quit)\s*$", re.I)
 
 
@@ -84,8 +89,8 @@ def classify_thread(msgs: list[dict]) -> dict | None:
 
     if any(_STOP.match((m.get("body") or "")) for m in inbound):
         outcome = "opted_out"
-    elif _CONFIRM.search(outbound_text):
-        outcome = "yes"                 # agreed to someone coming to them
+    elif _CONFIRM.search(outbound_text) or _ACQUISITION.search(outbound_text):
+        outcome = "yes"                 # agreed to someone coming to them / acquisition hand-off
     elif _VALUE_ONLY.search(outbound_text):
         outcome = "value_only"          # wants the number, not the conversation
     elif _DECLINE.search(outbound_text):
