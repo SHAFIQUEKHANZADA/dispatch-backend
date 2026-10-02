@@ -50,6 +50,23 @@ _VALUE_ONLY = re.compile(r"have that number ready for you", re.I)
 _ACQUISITION = re.compile(r"acquisition team will be with you", re.I)
 _STOP = re.compile(r"^\s*(stop|stopall|unsubscribe|end|quit)\s*$", re.I)
 
+# Reading the customer's OWN reply, as a fallback for when our scripted branch
+# never went out. The opener asks "have you been appraised lately?" — so a plain
+# "no" is the opportunity (they haven't been, send the team over), and a "yes" is
+# someone who already has. We only reach these when none of the outbound branches
+# above matched, i.e. the connector's follow-up failed to send (the step/config
+# bug that left real "no" opportunities showing as a bare "Replied").
+#
+# Order matters: a brush-off ("no thanks", "not interested") is a decline, not the
+# "no, I haven't been appraised" we want — so _DECLINE_REPLY is checked first.
+_DECLINE_REPLY = re.compile(
+    r"\b(not interested|no thanks?|no thank you|i'?m good|im good|all set|"
+    r"leave me alone|remove me)\b", re.I)
+_NO_REPLY_TEXT = re.compile(
+    r"^\s*(no|nope|nah|not yet|haven'?t|have not|never|negative)\b", re.I)
+_YES_REPLY_TEXT = re.compile(
+    r"^\s*(yes|yeah|yep|yup|ya|i have|already|recently|just did|last (week|month))\b", re.I)
+
 
 def _dt(v) -> datetime | None:
     if not v:
@@ -90,13 +107,22 @@ def classify_thread(msgs: list[dict]) -> dict | None:
     if any(_STOP.match((m.get("body") or "")) for m in inbound):
         outcome = "opted_out"
     elif _CONFIRM.search(outbound_text) or _ACQUISITION.search(outbound_text):
-        outcome = "yes"                 # agreed to someone coming to them / acquisition hand-off
+        outcome = "opportunity"         # we sent the acquisition hand-off: confirmed opportunity
     elif _VALUE_ONLY.search(outbound_text):
         outcome = "value_only"          # wants the number, not the conversation
     elif _DECLINE.search(outbound_text):
         outcome = "declined"
+    # No scripted branch went out — fall back to the customer's own words, so a
+    # real "no, I haven't been appraised" is still counted even when our follow-up
+    # failed to fire. "Opportunity" = hasn't been appraised; the opener asked that.
+    elif reply_text and _DECLINE_REPLY.search(reply_text):
+        outcome = "declined"
+    elif reply_text and _NO_REPLY_TEXT.match(reply_text):
+        outcome = "opportunity"         # "No" — hasn't been appraised → the opportunity
+    elif reply_text and _YES_REPLY_TEXT.match(reply_text):
+        outcome = "already_appraised"   # "Yes" — already appraised, nothing to do
     elif inbound:
-        outcome = "engaged"             # replied, but the branch never resolved
+        outcome = "engaged"             # replied, but we can't read it as yes/no
     else:
         outcome = "no_reply"
 
